@@ -14,7 +14,47 @@
 	--border: rgba(255,255,255,0.04);
 }
 
-html,body{height:100%;background:var(--bg);color:#e6e6e9}
+html,body{height:100%;color:#e6e6e9}
+
+/* Decorative background layers (circles + soft glow) */
+body{
+	background:var(--bg);
+	position:relative;
+	overflow-x:hidden;
+}
+
+body::before{
+	content: "";
+	position:fixed;
+	left:-8%;
+	top:-12%;
+	width:720px;
+	height:720px;
+	background: radial-gradient(circle at 30% 30%, rgba(73,5,154,0.16), rgba(73,5,154,0.06) 30%, rgba(73,5,154,0.02) 55%, transparent 60%);
+	filter: blur(64px);
+	pointer-events:none;
+	z-index:0;
+	transform: translate3d(0,0,0);
+	animation: floatA 14s ease-in-out infinite;
+}
+
+body::after{
+	content: "";
+	position:fixed;
+	right:-6%;
+	bottom:-10%;
+	width:520px;
+	height:520px;
+	background: radial-gradient(circle at 70% 70%, rgba(73,5,154,0.10), rgba(73,5,154,0.04) 30%, rgba(255,107,107,0.03) 60%, transparent 65%);
+	filter: blur(52px);
+	pointer-events:none;
+	z-index:0;
+	animation: floatB 18s ease-in-out infinite;
+}
+
+@keyframes floatA{ 0%{transform:translateY(0)}50%{transform:translateY(24px)}100%{transform:translateY(0)} }
+@keyframes floatB{ 0%{transform:translateY(0)}50%{transform:translateY(-18px)}100%{transform:translateY(0)} }
+
 
 .site-header{background:linear-gradient(90deg, rgba(73,5,154,0.10), rgba(73,5,154,0.03)); border-bottom:1px solid var(--border);} 
 .site-header .header-inner{display:flex;align-items:center;justify-content:space-between;gap:1rem;padding:0.6rem 1rem;max-width:1200px;margin:0 auto}

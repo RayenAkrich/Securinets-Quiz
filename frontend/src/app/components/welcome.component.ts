@@ -15,7 +15,7 @@ import { RouterLink } from '@angular/router';
         <p class="description">Securinets-Quiz is an online platform developed for the SecurinetsFST organization. It is designed to host tests in the form of quizzes, allowing users to participate in exams and receive instant feedback on their results.</p>
 
         <div class="actions">
-          <a class="btn primary" routerLink="/get-started">Get Started</a>
+          <a class="btn primary" routerLink="/signup">Get Started</a>
           <a class="btn" routerLink="/quizzes">Explore Quizzes</a>
         </div>
       </div>
