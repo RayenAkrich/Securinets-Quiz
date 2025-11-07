@@ -55,3 +55,5 @@ CREATE TABLE AdminLog (
     reason VARCHAR2(500),
     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+select * FROM USERS;
