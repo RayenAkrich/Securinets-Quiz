@@ -141,6 +141,323 @@ def api_admin_ban_user(user_id):
         app.logger.exception('Error banning user: %s', e)
         return jsonify({'ok': False, 'message': 'Database error'}), 500
 
+@app.route('/api/admin/quizzes', methods=['GET'])
+def api_admin_get_quizzes():
+    """Return quizzes for admin panel. Returns quizID, title, description, timelimit, question_count"""
+    # auth
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer '):
+        return jsonify({'ok': False, 'message': 'Missing authorization token'}), 401
+    token = auth.split(' ', 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+    except Exception as e:
+        app.logger.debug('JWT decode error: %s', e)
+        return jsonify({'ok': False, 'message': 'Invalid or expired token'}), 401
+    if payload.get('role') != 'admin':
+        return jsonify({'ok': False, 'message': 'Forbidden'}), 403
+
+    if not ORACLE_AVAILABLE:
+        return jsonify({'ok': True, 'quizzes': []})
+
+    try:
+        conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+        cur = conn.cursor()
+        cur.execute("SELECT quizID, title, description, timelimit FROM Quiz ORDER BY created_at DESC")
+        quizzes = []
+        for row in cur.fetchall():
+            quizID, title, description, timelimit = row
+            # get question count
+            qcur = conn.cursor()
+            qcur.execute("SELECT COUNT(*) FROM Questions WHERE quizID = :1", [quizID])
+            qc = qcur.fetchone()
+            question_count = int(qc[0]) if qc else 0
+            qcur.close()
+            quizzes.append({'quizID': quizID, 'title': title, 'description': description, 'timelimit': timelimit, 'question_count': question_count})
+        cur.close()
+        conn.close()
+        return jsonify({'ok': True, 'quizzes': quizzes}), 200
+    except Exception as e:
+        app.logger.exception('DB error fetching quizzes: %s', e)
+        return jsonify({'ok': False, 'message': 'Database error'}), 500
+
+
+@app.route('/api/admin/quizzes/<int:quiz_id>', methods=['GET'])
+def api_admin_get_quiz(quiz_id):
+    """Return a single quiz with nested questions and answers for admin editing."""
+    # admin check
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer '):
+        return jsonify({'ok': False, 'message': 'Missing authorization token'}), 401
+    token = auth.split(' ', 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+    except Exception as e:
+        app.logger.debug('JWT decode error: %s', e)
+        return jsonify({'ok': False, 'message': 'Invalid or expired token'}), 401
+    if payload.get('role') != 'admin':
+        return jsonify({'ok': False, 'message': 'Forbidden'}), 403
+
+    if not ORACLE_AVAILABLE:
+        return jsonify({'ok': True, 'quiz': None})
+
+    try:
+        conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+        cur = conn.cursor()
+        cur.execute("SELECT quizID, title, description, timelimit FROM Quiz WHERE quizID = :1", [quiz_id])
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Quiz not found'}), 404
+        quizID, title, description, timelimit = row
+        # get questions
+        qcur = conn.cursor()
+        qcur.execute("SELECT questionID, title, category, difficulty, points, description FROM Questions WHERE quizID = :1 ORDER BY questionID", [quizID])
+        questions = []
+        for qrow in qcur.fetchall():
+            questionID, qtitle, qcategory, qdifficulty, qpoints, qdesc = qrow
+            acur = conn.cursor()
+            acur.execute("SELECT answerID, answer_text, is_correct FROM Answers WHERE questionID = :1 ORDER BY answerID", [questionID])
+            answers = []
+            for arow in acur.fetchall():
+                answerID, answer_text, is_correct = arow
+                answers.append({'answerID': answerID, 'text': answer_text, 'is_correct': True if is_correct == 'Y' else False})
+            acur.close()
+            questions.append({'questionID': questionID, 'title': qtitle, 'category': qcategory, 'difficulty': qdifficulty, 'points': qpoints, 'description': qdesc, 'answers': answers})
+        qcur.close()
+        cur.close()
+        conn.close()
+        return jsonify({'ok': True, 'quiz': {'quizID': quizID, 'title': title, 'description': description, 'timelimit': timelimit, 'questions': questions}}), 200
+    except Exception as e:
+        app.logger.exception('DB error fetching quiz: %s', e)
+        return jsonify({'ok': False, 'message': 'Database error'}), 500
+
+
+@app.route('/api/admin/quizzes/<int:quiz_id>', methods=['PUT'])
+def api_admin_update_quiz(quiz_id):
+    """Update an existing quiz (replace questions/answers). Expects same JSON shape as create."""
+    try:
+        admin_payload = admin_required()
+    except Exception:
+        raise
+
+    payload = request.get_json() or {}
+    title = (payload.get('title') or '').strip()
+    description = payload.get('description') or ''
+    timelimit = payload.get('timelimit')
+    questions = payload.get('questions') or []
+
+    if not title:
+        return jsonify({'ok': False, 'message': 'Quiz title is required'}), 400
+
+    if not ORACLE_AVAILABLE:
+        return jsonify({'ok': False, 'message': 'Database not available'}), 503
+
+    try:
+        conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+        cur = conn.cursor()
+        # Ensure quiz exists
+        cur.execute("SELECT quizID FROM Quiz WHERE quizID = :1", [quiz_id])
+        if not cur.fetchone():
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Quiz not found'}), 404
+
+        # Update quiz metadata
+        cur.execute("UPDATE Quiz SET title = :1, description = :2, timelimit = :3 WHERE quizID = :4", [title, description, timelimit, quiz_id])
+
+        # Remove existing answers and questions for this quiz
+        try:
+            # Delete answers linked to questions of this quiz
+            cur.execute("DELETE FROM Answers WHERE questionID IN (SELECT questionID FROM Questions WHERE quizID = :1)", [quiz_id])
+            # Delete questions
+            cur.execute("DELETE FROM Questions WHERE quizID = :1", [quiz_id])
+        except Exception:
+            # If DB doesn't support subqueries for delete or other edge cases, attempt safer fallback
+            app.logger.exception('Error deleting old questions/answers; continuing')
+
+        # Insert new questions and answers
+        for q in questions:
+            qtitle = (q.get('title') or '').strip()
+            qcategory = q.get('category') or None
+            qdifficulty = q.get('difficulty') or None
+            qpoints = q.get('points') if q.get('points') is not None else None
+            qdesc = q.get('description') or None
+            if not qtitle:
+                continue
+            qid_var = cur.var(oracledb.NUMBER)
+            cur.execute(
+                "INSERT INTO Questions (quizID, title, category, difficulty, points, description) VALUES (:1, :2, :3, :4, :5, :6) RETURNING questionID INTO :7",
+                [quiz_id, qtitle, qcategory, qdifficulty, qpoints, qdesc, qid_var]
+            )
+            question_id = int(qid_var.getvalue()[0])
+            answers = q.get('answers') or []
+            for a in answers:
+                atext = (a.get('text') or '').strip()
+                if not atext:
+                    continue
+                is_correct = 'Y' if a.get('is_correct') else 'N'
+                cur.execute(
+                    "INSERT INTO Answers (questionID, answer_text, is_correct) VALUES (:1, :2, :3)",
+                    [question_id, atext, is_correct]
+                )
+
+        # Log admin action: Quiz Updated
+        try:
+            action = 'Quiz Updated'
+            log_reason = f"By {admin_payload.get('name')}"
+            cur.execute("INSERT INTO AdminLog (action, reason) VALUES (:1, :2)", [action, log_reason])
+        except Exception:
+            app.logger.exception('Failed to write AdminLog for quiz update')
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'ok': True, 'message': 'Quiz updated', 'quizID': quiz_id}), 200
+
+    except Exception as e:
+        app.logger.exception('Error updating quiz: %s', e)
+        return jsonify({'ok': False, 'message': 'Database error while updating quiz'}), 500
+
+@app.route('/api/admin/quizzes/<int:quiz_id>', methods=['DELETE'])
+def api_admin_delete_quiz(quiz_id):
+    """Delete a quiz and its dependent questions/answers (DB cascade expected)."""
+    try:
+        admin_payload = admin_required()
+    except Exception:
+        raise
+
+    if not ORACLE_AVAILABLE:
+        return jsonify({'ok': False, 'message': 'Database not available'}), 503
+
+    try:
+        conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+        cur = conn.cursor()
+        # Fetch quiz title for logging
+        cur.execute("SELECT title FROM Quiz WHERE quizID = :1", [quiz_id])
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Quiz not found'}), 404
+        title = row[0]
+
+        # Delete quiz (should cascade to Questions/Answers if foreign keys set)
+        cur.execute("DELETE FROM Quiz WHERE quizID = :1", [quiz_id])
+
+        # Log admin action
+        try:
+            action = f"Quiz Deleted: {title}"
+            log_reason = f"By {admin_payload.get('name')}"
+            cur.execute("INSERT INTO AdminLog (action, reason) VALUES (:1, :2)", [action, log_reason])
+        except Exception:
+            app.logger.exception('Failed to write AdminLog for quiz deletion')
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'ok': True, 'message': 'Quiz deleted'}), 200
+    except Exception as e:
+        app.logger.exception('Error deleting quiz: %s', e)
+        return jsonify({'ok': False, 'message': 'Database error while deleting quiz'}), 500
+    
+@app.route('/api/admin/quizzes', methods=['POST'])
+def api_admin_create_quiz():
+    """Create a quiz with questions and answers. Expects JSON:
+    { title, description, timelimit, questions: [ { title, category, difficulty, points, description, answers: [{ text, is_correct }] } ] }
+    """
+    payload = request.get_json() or {}
+    title = (payload.get('title') or '').strip()
+    description = payload.get('description') or ''
+    timelimit = payload.get('timelimit')
+    questions = payload.get('questions') or []
+
+    if not title:
+        return jsonify({'ok': False, 'message': 'Quiz title is required'}), 400
+    if not isinstance(questions, list) or len(questions) == 0:
+        return jsonify({'ok': False, 'message': 'At least one question is required'}), 400
+
+    # admin check
+    try:
+        admin_payload = admin_required()
+    except Exception as e:
+        # admin_required will abort with proper code
+        raise
+
+    if not ORACLE_AVAILABLE:
+        return jsonify({'ok': False, 'message': 'Database not available'}), 503
+
+    try:
+        conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+        cur = conn.cursor()
+
+        # Insert quiz and get generated quizID
+        try:
+            quiz_id_var = cur.var(oracledb.NUMBER)
+            cur.execute(
+                "INSERT INTO Quiz (title, description, timelimit) VALUES (:1, :2, :3) RETURNING quizID INTO :4",
+                [title, description, timelimit, quiz_id_var]
+            )
+            quiz_id = int(quiz_id_var.getvalue()[0])
+        except Exception:
+            # Fallback: insert without returning and select last inserted by title (less safe)
+            cur.execute("INSERT INTO Quiz (title, description, timelimit) VALUES (:1, :2, :3)", [title, description, timelimit])
+            conn.commit()
+            # Attempt to retrieve recent quiz with same title
+            cur.execute("SELECT quizID FROM (SELECT quizID FROM Quiz WHERE title = :1 ORDER BY created_at DESC) WHERE ROWNUM = 1", [title])
+            row = cur.fetchone()
+            quiz_id = int(row[0]) if row else None
+
+        if not quiz_id:
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Failed to create quiz'}), 500
+
+        # Insert questions and answers
+        for q in questions:
+            qtitle = (q.get('title') or '').strip()
+            qcategory = q.get('category') or None
+            qdifficulty = q.get('difficulty') or None
+            qpoints = q.get('points') if q.get('points') is not None else None
+            qdesc = q.get('description') or None
+            if not qtitle:
+                continue
+            qid_var = cur.var(oracledb.NUMBER)
+            cur.execute(
+                "INSERT INTO Questions (quizID, title, category, difficulty, points, description) VALUES (:1, :2, :3, :4, :5, :6) RETURNING questionID INTO :7",
+                [quiz_id, qtitle, qcategory, qdifficulty, qpoints, qdesc, qid_var]
+            )
+            question_id = int(qid_var.getvalue()[0])
+            answers = q.get('answers') or []
+            for a in answers:
+                atext = (a.get('text') or '').strip()
+                if not atext:
+                    continue
+                is_correct = 'Y' if a.get('is_correct') else 'N'
+                cur.execute(
+                    "INSERT INTO Answers (questionID, answer_text, is_correct) VALUES (:1, :2, :3)",
+                    [question_id, atext, is_correct]
+                )
+
+        # Log admin action: Quiz Added
+        try:
+            action = 'Quiz Added'
+            log_reason = f"By {admin_payload.get('name')}"
+            cur.execute("INSERT INTO AdminLog (action, reason) VALUES (:1, :2)", [action, log_reason])
+        except Exception:
+            app.logger.exception('Failed to write AdminLog for quiz creation')
+
+        # Commit everything
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'ok': True, 'message': 'Quiz created', 'quizID': quiz_id}), 201
+
+    except Exception as e:
+        app.logger.exception('Error creating quiz: %s', e)
+        return jsonify({'ok': False, 'message': 'Database error while creating quiz'}), 500
+
 def send_verification_email(to_email: str, code: str) -> None:
     """Send a simple verification email containing the 5-digit code using Gmail SMTP.
 
@@ -170,12 +487,6 @@ def _cleanup_expired():
     expired = [email for email, v in pending_signups.items() if v['expires_at'] <= now]
     for email in expired:
         pending_signups.pop(email, None)
-
-
-@app.route('/')
-def index():
-    return "Hello from Flask"
-
 
 @app.route('/api/signup', methods=['POST'])
 def api_signup():
