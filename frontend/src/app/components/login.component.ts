@@ -84,12 +84,14 @@ export class LoginComponent {
             console.warn('Failed to write to localStorage', e);
           }
           this.message = 'Logged in successfully.';
-          // navigate to quizzes
+          // redirect based on role
+          let target = '/quizzes';
+          if (res.user.role === 'admin') target = '/admin';
+          else if (res.user.role === 'banned') target = '/banned';
           try {
-            this.router.navigate(['/quizzes']);
+            this.router.navigate([target]);
           } catch (e) {
-            // If navigation fails, keep the message visible
-            console.warn('Navigation to /quizzes failed', e);
+            console.warn('Navigation failed', e);
           }
         } else {
           this.message = res && res.message ? res.message : 'Login failed';
