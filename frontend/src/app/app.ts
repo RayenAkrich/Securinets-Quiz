@@ -13,12 +13,10 @@ import { HttpClient, HttpClientModule, HttpHeaders } from '@angular/common/http'
 export class App {
   protected readonly title = signal('securinets-frontend');
   isLogged = false;
+  userRole: string | null = null;
 
   constructor(private router: Router, private http: HttpClient) {
-    // Check token validity on load
     this.checkAuth();
-
-    // On navigation, re-check auth status to keep header in sync
     this.router.events.pipe(filter((e): e is NavigationEnd => e instanceof NavigationEnd)).subscribe(() => {
       this.checkAuth();
     });
@@ -28,13 +26,13 @@ export class App {
     const token = localStorage.getItem('token');
     if (!token) {
       this.isLogged = false;
+      this.userRole = null;
       return;
     }
     const headers = new HttpHeaders({ Authorization: `Bearer ${token}` });
     this.http.get<any>('/api/me', { headers }).subscribe({
       next: (res) => {
         if (res && res.ok && res.user) {
-          // ensure local name/email are in sync with server
           try {
             localStorage.setItem('userName', res.user.name || '');
             localStorage.setItem('userEmail', res.user.email || '');
@@ -42,20 +40,20 @@ export class App {
             console.warn('Failed to write to localStorage', e);
           }
           this.isLogged = true;
+          this.userRole = res.user.role || null;
         } else {
           this.isLogged = false;
+          this.userRole = null;
         }
       },
       error: () => {
-        // invalid/expired token -> clear
         try {
           localStorage.removeItem('token');
           localStorage.removeItem('userName');
           localStorage.removeItem('userEmail');
-        } catch (e) {
-          /* ignore */
-        }
+        } catch (e) {}
         this.isLogged = false;
+        this.userRole = null;
       }
     });
   }
@@ -69,6 +67,7 @@ export class App {
       console.warn('Failed to clear localStorage during logout', e);
     }
     this.isLogged = false;
+    this.userRole = null;
     this.router.navigate(['/']);
   }
 }
