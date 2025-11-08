@@ -47,6 +47,99 @@ if JWT_SECRET == 'please-change-this-secret':
 # { email: { full_name, password_hash, code_hash, expires_at, attempts, blocked_until } }
 pending_signups = {}
 
+from flask import abort
+def admin_required():
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer '):
+        abort(401, description='Missing authorization token')
+    token = auth.split(' ', 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+    except Exception as e:
+        app.logger.debug('JWT decode error: %s', e)
+        abort(401, description='Invalid or expired token')
+    if payload.get('role') != 'admin':
+        abort(403, description='Forbidden')
+    return payload
+@app.route('/api/admin/users/<int:user_id>', methods=['DELETE'])
+def api_admin_delete_user(user_id):
+    payload = admin_required()
+    data = request.get_json() or {}
+    reason = (data.get('reason') or '').strip()
+    if not reason:
+        return jsonify({'ok': False, 'message': 'Reason is required'}), 400
+    if not ORACLE_AVAILABLE:
+        return jsonify({'ok': False, 'message': 'Database not available'}), 503
+    try:
+        conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+        cur = conn.cursor()
+        # Get user info
+        cur.execute("SELECT name, role FROM Users WHERE userID = :1", [user_id])
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'User not found'}), 404
+        username, userrole = row
+        if userrole == 'admin':
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Cannot delete admin user'}), 403
+        # Delete user
+        cur.execute("DELETE FROM Users WHERE userID = :1", [user_id])
+        # Log action
+        action = f"delete {username}"
+        log_reason = f"By {payload.get('name')} because of {reason}"
+        cur.execute("INSERT INTO AdminLog (action, reason) VALUES (:1, :2)", [action, log_reason])
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'ok': True, 'message': 'User deleted'}), 200
+    except Exception as e:
+        app.logger.exception('Error deleting user: %s', e)
+        return jsonify({'ok': False, 'message': 'Database error'}), 500
+
+@app.route('/api/admin/users/<int:user_id>/ban', methods=['PATCH'])
+def api_admin_ban_user(user_id):
+    payload = admin_required()
+    data = request.get_json() or {}
+    reason = (data.get('reason') or '').strip()
+    if not reason:
+        return jsonify({'ok': False, 'message': 'Reason is required'}), 400
+    if not ORACLE_AVAILABLE:
+        return jsonify({'ok': False, 'message': 'Database not available'}), 503
+    try:
+        conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+        cur = conn.cursor()
+        # Get user info
+        cur.execute("SELECT name, role FROM Users WHERE userID = :1", [user_id])
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'User not found'}), 404
+        username, userrole = row
+        if userrole == 'admin':
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Cannot ban admin user'}), 403
+        if userrole == 'banned':
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'User already banned'}), 400
+        # Ban user
+        cur.execute("UPDATE Users SET role = 'banned' WHERE userID = :1", [user_id])
+        # Log action
+        action = f"ban {username}"
+        log_reason = f"By {payload.get('name')} because of {reason}"
+        cur.execute("INSERT INTO AdminLog (action, reason) VALUES (:1, :2)", [action, log_reason])
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({'ok': True, 'message': 'User banned'}), 200
+    except Exception as e:
+        app.logger.exception('Error banning user: %s', e)
+        return jsonify({'ok': False, 'message': 'Database error'}), 500
 
 def send_verification_email(to_email: str, code: str) -> None:
     """Send a simple verification email containing the 5-digit code using Gmail SMTP.
@@ -268,6 +361,36 @@ def api_me():
     user = {'userID': payload.get('sub'), 'name': payload.get('name'), 'email': payload.get('email'), 'role': payload.get('role')}
     return jsonify({'ok': True, 'user': user}), 200
 
+@app.route('/api/admin/users', methods=['GET'])
+def api_admin_users():
+    """Return all users for admin panel (admin only)."""
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer '):
+        return jsonify({'ok': False, 'message': 'Missing authorization token'}), 401
+    token = auth.split(' ', 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+    except Exception as e:
+        app.logger.debug('JWT decode error: %s', e)
+        return jsonify({'ok': False, 'message': 'Invalid or expired token'}), 401
+    if payload.get('role') != 'admin':
+        return jsonify({'ok': False, 'message': 'Forbidden'}), 403
+    if not ORACLE_AVAILABLE:
+        return jsonify({'ok': True, 'users': []})
+    try:
+        conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+        cur = conn.cursor()
+        cur.execute("SELECT userID, name, email, role FROM Users")
+        users = [
+            {'userID': row[0], 'name': row[1], 'email': row[2], 'role': row[3]}
+            for row in cur.fetchall()
+        ]
+        cur.close()
+        conn.close()
+    except Exception as e:
+        app.logger.exception('DB error fetching users: %s', e)
+        return jsonify({'ok': False, 'message': 'Database error'}), 500
+    return jsonify({'ok': True, 'users': users})
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000)
