@@ -35,6 +35,7 @@ import { HttpClient, HttpClientModule } from '@angular/common/http';
 
             <button class="btn primary" type="submit" [disabled]="loading">{{ loading ? 'Sending…' : 'Sign Up' }}</button>
           </form>
+          <p *ngIf="step==='form' && message" style="margin-top:.6rem;color:#f0b">{{ message }}</p>
 
           <!-- Verification step -->
           <div *ngIf="step==='verify'">
@@ -106,7 +107,12 @@ export class SignupComponent {
       },
       error: err => {
         this.loading = false;
-        this.message = err?.error?.message || 'Failed to send verification code.';
+        if (err?.status === 409) {
+          // Email already registered
+          this.message = err?.error?.message || 'A user with this email already exists.';
+        } else {
+          this.message = err?.error?.message || 'Failed to send verification code.';
+        }
       }
     });
   }
