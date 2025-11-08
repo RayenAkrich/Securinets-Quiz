@@ -77,6 +77,9 @@ export class LoginComponent {
           try {
             localStorage.setItem('userName', res.user.name || '');
             localStorage.setItem('userEmail', res.user.email || '');
+            if (res.token) {
+              localStorage.setItem('token', res.token);
+            }
           } catch (e) {
             console.warn('Failed to write to localStorage', e);
           }

@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
+import jwt
+from datetime import datetime, timedelta
 try:
     import oracledb  # optional: may not be installed in dev
     ORACLE_AVAILABLE = True
@@ -33,6 +35,13 @@ MAIL_APP_PASSWORD = os.environ.get('MAIL_APP_PASSWORD')
 # Ops flags and rate-limit config
 MAX_VERIFY_ATTEMPTS = int(os.environ.get('MAX_VERIFY_ATTEMPTS', '5'))
 LOCKOUT_SECONDS = int(os.environ.get('LOCKOUT_SECONDS', str(15 * 60)))
+
+# JWT configuration
+JWT_SECRET = os.environ.get('JWT_SECRET', 'please-change-this-secret')
+JWT_ALGO = os.environ.get('JWT_ALGO', 'HS256')
+JWT_EXP_SECONDS = int(os.environ.get('JWT_EXP_SECONDS', '14000'))
+if JWT_SECRET == 'please-change-this-secret':
+    app.logger.warning('Using default JWT_SECRET; set JWT_SECRET in environment for production')
 
 # In-memory store for pending signups:
 # { email: { full_name, password_hash, code_hash, expires_at, attempts, blocked_until } }
@@ -229,9 +238,35 @@ def api_login():
             return jsonify({'ok': False, 'message': 'Invalid email or password'}), 401
 
         user = {'userID': userID, 'name': name, 'email': email_db, 'role': role}
-        return jsonify({'ok': True, 'message': 'Logged in', 'user': user}), 200
+        # Issue JWT
+        payload = {
+            'sub': userID,
+            'name': name,
+            'email': email_db,
+            'role': role,
+            'exp': datetime.utcnow() + timedelta(seconds=JWT_EXP_SECONDS)
+        }
+        token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+        return jsonify({'ok': True, 'message': 'Logged in', 'user': user, 'token': token}), 200
 
     return jsonify({'ok': False, 'message': 'Database not available or invalid credentials'}), 503
+
+
+@app.route('/api/me', methods=['GET'])
+def api_me():
+    """Return authenticated user info when provided a valid Bearer JWT."""
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer '):
+        return jsonify({'ok': False, 'message': 'Missing authorization token'}), 401
+    token = auth.split(' ', 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+    except Exception as e:
+        app.logger.debug('JWT decode error: %s', e)
+        return jsonify({'ok': False, 'message': 'Invalid or expired token'}), 401
+
+    user = {'userID': payload.get('sub'), 'name': payload.get('name'), 'email': payload.get('email'), 'role': payload.get('role')}
+    return jsonify({'ok': True, 'user': user}), 200
 
 
 if __name__ == '__main__':

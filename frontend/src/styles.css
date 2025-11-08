@@ -65,8 +65,13 @@ body::after{
 .main-nav a{color:#d8d8da;text-decoration:none;padding:0.35rem 0.5rem;border-radius:6px}
 .main-nav a:hover{background:rgba(255,255,255,0.8);color:#49059a;transform: translateY(-4px);}
 .main-nav a:active{transform: translateY(-2px) scale(0.995)}
-.header-actions .btn.small{padding:0.35rem 0.6rem;border:2px solid var(--accent);border-radius:8px;color:var(--accent);text-decoration:none;font-weight:600}
+.header-actions .btn.small{padding:0.35rem 0.6rem;border:2px solid var(--accent);border-radius:8px;color:var(--accent);text-decoration:none;font-weight:600;background:transparent;cursor:pointer}
 .header-actions .btn.small:hover{background:var(--accent);color:var(--accent-contrast)}
+
+/* Ensure buttons look like anchors when used in header (reset native button styles) */
+.header-actions button.btn.small{appearance:none;-webkit-appearance:none;-moz-appearance:none;border:none;background:transparent;padding:0;margin:0;font-family:Inter;}
+.header-actions button.btn.small{padding:0.35rem 0.6rem;border:2px solid var(--accent);border-radius:8px;color:var(--accent);text-decoration:none;font-weight:600;cursor:pointer}
+.header-actions button.btn.small:hover{background:var(--accent);color:var(--accent-contrast)}
 .container{width:100%;padding:0 1rem}
 a{color:var(--accent)}
 
