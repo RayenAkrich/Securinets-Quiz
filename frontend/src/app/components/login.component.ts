@@ -1,10 +1,13 @@
 import { Component } from '@angular/core';
-import { RouterLink } from '@angular/router';
+import { RouterLink, Router } from '@angular/router';
+import { HttpClient, HttpClientModule } from '@angular/common/http';
+import { FormsModule } from '@angular/forms';
+import { CommonModule } from '@angular/common';
 
 @Component({
   selector: 'app-login',
   standalone: true,
-  imports: [RouterLink],
+  imports: [RouterLink, HttpClientModule, FormsModule, CommonModule],
   template: `
     <div class="auth-page">
       <div class="visual">
@@ -18,15 +21,16 @@ import { RouterLink } from '@angular/router';
           <h2>Sign In</h2>
           <p class="muted">Welcome back — please sign in to continue</p>
 
-          <form>
+          <form (ngSubmit)="login()">
             <label>Email</label>
-            <input type="email" placeholder="name@example.com" />
+            <input type="email" placeholder="name@example.com" [(ngModel)]="email" name="email" />
 
             <label>Password</label>
-            <input type="password" placeholder="••••••••" />
+            <input type="password" placeholder="••••••••" [(ngModel)]="password" name="password" />
 
-            <button class="btn primary" type="button">Sign In</button>
+            <button class="btn primary" type="button" (click)="login()">Sign In</button>
           </form>
+          <p *ngIf="message" class="muted">{{message}}</p>
 
           <p class="signup-link">Don't have an account? <a routerLink="/signup">Create account</a></p>
         </div>
@@ -56,4 +60,42 @@ import { RouterLink } from '@angular/router';
     `
   ]
 })
-export class LoginComponent {}
+export class LoginComponent {
+  email = '';
+  password = '';
+  message = '';
+
+  constructor(private http: HttpClient, private router: Router) {}
+
+  login(): void {
+    this.message = '';
+    const payload = { email: this.email, password: this.password };
+    this.http.post<any>('/api/login', payload).subscribe({
+      next: (res) => {
+        if (res && res.ok && res.user) {
+          // Save to localStorage
+          try {
+            localStorage.setItem('userName', res.user.name || '');
+            localStorage.setItem('userEmail', res.user.email || '');
+          } catch (e) {
+            console.warn('Failed to write to localStorage', e);
+          }
+          this.message = 'Logged in successfully.';
+          // navigate to quizzes
+          try {
+            this.router.navigate(['/quizzes']);
+          } catch (e) {
+            // If navigation fails, keep the message visible
+            console.warn('Navigation to /quizzes failed', e);
+          }
+        } else {
+          this.message = res && res.message ? res.message : 'Login failed';
+        }
+      },
+      error: (err) => {
+        if (err && err.error && err.error.message) this.message = err.error.message;
+        else this.message = 'Network or server error during login';
+      }
+    });
+  }
+}

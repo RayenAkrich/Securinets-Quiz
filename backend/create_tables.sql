@@ -32,6 +32,7 @@ CREATE TABLE Questions (
     title VARCHAR2(200) NOT NULL,
     category VARCHAR2(50),
     difficulty VARCHAR2(20),
+    points NUMBER,
     description VARCHAR2(500)
 );
 

@@ -6,7 +6,7 @@ import ssl
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-from werkzeug.security import generate_password_hash
+from werkzeug.security import generate_password_hash, check_password_hash
 try:
     import oracledb  # optional: may not be installed in dev
     ORACLE_AVAILABLE = True
@@ -30,7 +30,12 @@ DB_DSN = os.environ.get('ORACLE_DB_DSN')
 MAIL_USER = os.environ.get('MAIL_USER')
 MAIL_APP_PASSWORD = os.environ.get('MAIL_APP_PASSWORD')
 
-# In-memory store for pending signups: { email: { full_name, password_hash, code, expires_at } }
+# Ops flags and rate-limit config
+MAX_VERIFY_ATTEMPTS = int(os.environ.get('MAX_VERIFY_ATTEMPTS', '5'))
+LOCKOUT_SECONDS = int(os.environ.get('LOCKOUT_SECONDS', str(15 * 60)))
+
+# In-memory store for pending signups:
+# { email: { full_name, password_hash, code_hash, expires_at, attempts, blocked_until } }
 pending_signups = {}
 
 
@@ -82,14 +87,33 @@ def api_signup():
 
     _cleanup_expired()
 
+    # If DB is available, check whether the email already exists in Users
+    if ORACLE_AVAILABLE:
+        try:
+            conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+            cur = conn.cursor()
+            cur.execute("SELECT userID FROM Users WHERE email = :1", [email])
+            existing = cur.fetchone()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            app.logger.exception('DB error checking existing user: %s', e)
+            return jsonify({'ok': False, 'message': 'Database error while checking existing user'}), 500
+
+        if existing:
+            return jsonify({'ok': False, 'message': 'A user with this email already exists'}), 409
+
     # If already pending, allow resending a new code
     code = str(random.randint(10000, 99999))
     password_hash = generate_password_hash(password)
+    code_hash = generate_password_hash(code)
     pending_signups[email] = {
         'full_name': full_name,
         'password_hash': password_hash,
-        'code': code,
-        'expires_at': time.time() + 10 * 60  # 10 minutes
+        'code_hash': code_hash,
+        'expires_at': time.time() + 10 * 60,  # 10 minutes
+        'attempts': 0,
+        'blocked_until': 0
     }
 
     # Send email (best-effort)
@@ -98,14 +122,14 @@ def api_signup():
     except Exception:
         app.logger.exception('Error sending verification email')
 
-    # Log the code for local/dev debugging so you can test without mail configured
-    app.logger.info('Pending signup created for %s (code=%s) expires_in=10m', email, code)
+    # Log creation (do not log the verification code)
+    app.logger.info('Pending signup created for %s, expires_in=10m', email)
 
-    # If mail isn't configured, return the code in the response for local testing only
+    # If mail isn't configured, return a generic acknowledgment (do not return the code)
     if not MAIL_USER or not MAIL_APP_PASSWORD:
-        return jsonify({'ok': True, 'message': 'Verification code generated (mail not configured)', 'dev_code': code}), 200
+        return jsonify({'ok': True, 'message': 'Verification code generated'}), 200
 
-    return jsonify({'ok': True, 'message': 'Verification code sent to email (if configured)'}), 200
+    return jsonify({'ok': True, 'message': 'Verification code sent to email'}), 200
 
 
 @app.route('/api/verify', methods=['POST'])
@@ -123,7 +147,34 @@ def api_verify():
     if not pending:
         return jsonify({'ok': False, 'message': 'No pending signup for this email or code expired'}), 400
 
-    if pending['code'] != code:
+    now = time.time()
+    # Check expiry
+    if pending.get('expires_at', 0) <= now:
+        # clean-up will remove it later; remove now to be explicit
+        pending_signups.pop(email, None)
+        return jsonify({'ok': False, 'message': 'No pending signup for this email or code expired'}), 400
+
+    # Check lockout
+    if pending.get('blocked_until', 0) > now:
+        return jsonify({'ok': False, 'message': 'Too many attempts. Try again later.'}), 429
+
+    # Verify using the stored hashed code
+    if 'code_hash' not in pending:
+        # Defensive: if no code_hash present treat as expired/missing
+        pending_signups.pop(email, None)
+        return jsonify({'ok': False, 'message': 'No pending signup for this email or code expired'}), 400
+
+    try:
+        valid = check_password_hash(pending['code_hash'], code)
+    except Exception:
+        valid = False
+
+    if not valid:
+        # increment attempts and possibly lock
+        pending['attempts'] = pending.get('attempts', 0) + 1
+        if pending['attempts'] >= MAX_VERIFY_ATTEMPTS:
+            pending['blocked_until'] = now + LOCKOUT_SECONDS
+            app.logger.warning('Pending signup for %s locked due to too many failed attempts', email)
         return jsonify({'ok': False, 'message': 'Invalid verification code'}), 400
 
     # Create user in the database (if driver available)
@@ -146,6 +197,41 @@ def api_verify():
     pending_signups.pop(email, None)
 
     return jsonify({'ok': True, 'message': 'Email verified and account created'}), 200
+
+
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    data = request.get_json() or {}
+    email = (data.get('email') or '').strip().lower()
+    password = data.get('password') or ''
+
+    if not email or not password:
+        return jsonify({'ok': False, 'message': 'email and password are required'}), 400
+
+    # If Oracle driver is available, check persistent Users table
+    if ORACLE_AVAILABLE:
+        try:
+            conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+            cur = conn.cursor()
+            cur.execute("SELECT userID, name, email, password, role FROM Users WHERE email = :1", [email])
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+        except Exception as e:
+            app.logger.exception('DB error during login: %s', e)
+            return jsonify({'ok': False, 'message': 'Database error during login'}), 500
+
+        if not row:
+            return jsonify({'ok': False, 'message': 'Invalid email or password'}), 401
+
+        userID, name, email_db, pw_hash, role = row
+        if not check_password_hash(pw_hash, password):
+            return jsonify({'ok': False, 'message': 'Invalid email or password'}), 401
+
+        user = {'userID': userID, 'name': name, 'email': email_db, 'role': role}
+        return jsonify({'ok': True, 'message': 'Logged in', 'user': user}), 200
+
+    return jsonify({'ok': False, 'message': 'Database not available or invalid credentials'}), 503
 
 
 if __name__ == '__main__':
