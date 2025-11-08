@@ -88,7 +88,7 @@ import { RouterLink } from '@angular/router';
 
       <div class="bottom-bar">
         <div>Copyright © 2025 SecuriQuiz</div>
-        <div class="bottom-links">All Rights Reserved | <a href="#">Terms and Conditions</a> | <a href="#">Privacy Policy</a></div>
+        <div class="bottom-links">All Rights Reserved | <a href="https://www.termsfeed.com/live/1b0b2d85-2553-4940-83d2-a571d3da34a8">Terms and Conditions</a> | <a href="https://www.termsfeed.com/live/1e007940-99a4-4b12-b3fd-db3a15b11050">Privacy Policy</a></div>
       </div>
     </footer>
   `,

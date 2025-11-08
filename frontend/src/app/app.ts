@@ -18,14 +18,9 @@ export class App {
     // Check token validity on load
     this.checkAuth();
 
-    // Redirect from root to /quizzes when logged in; also check auth on navigation
-    this.router.events.pipe(filter((e): e is NavigationEnd => e instanceof NavigationEnd)).subscribe((ev) => {
-      const url = ev.urlAfterRedirects || ev.url;
-      // re-check auth status on each navigation to keep header in sync
+    // On navigation, re-check auth status to keep header in sync
+    this.router.events.pipe(filter((e): e is NavigationEnd => e instanceof NavigationEnd)).subscribe(() => {
       this.checkAuth();
-      if (this.isLogged && (url === '/' || url === '')) {
-        this.router.navigate(['/quizzes']);
-      }
     });
   }
 
