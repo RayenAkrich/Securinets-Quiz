@@ -361,6 +361,240 @@ def api_admin_delete_quiz(quiz_id):
     except Exception as e:
         app.logger.exception('Error deleting quiz: %s', e)
         return jsonify({'ok': False, 'message': 'Database error while deleting quiz'}), 500
+
+
+@app.route('/api/quizzes', methods=['GET'])
+def api_get_quizzes():
+    """Return available quizzes to users. If an Authorization bearer token is provided,
+    include whether the user has already taken/passed each quiz (using UserQuiz table).
+    """
+    # Try to read optional auth token
+    user_id = None
+    auth = request.headers.get('Authorization', '')
+    if auth.startswith('Bearer '):
+        token = auth.split(' ', 1)[1].strip()
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+            user_id = payload.get('sub')
+        except Exception:
+            # ignore token errors; treat as anonymous
+            user_id = None
+
+    if not ORACLE_AVAILABLE:
+        # return empty list when DB not available
+        return jsonify({'ok': True, 'quizzes': []}), 200
+
+    try:
+        conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+        cur = conn.cursor()
+        cur.execute("SELECT quizID, title, description, timelimit FROM Quiz ORDER BY created_at DESC")
+        quizzes = []
+        for row in cur.fetchall():
+            quizID, title, description, timelimit = row
+            user_taken = False
+            user_passed = False
+            user_score = None
+            if user_id:
+                uqcur = conn.cursor()
+                uqcur.execute("SELECT score, passed FROM UserQuiz WHERE quizID = :1 AND userID = :2 ORDER BY taken_at DESC", [quizID, user_id])
+                urow = uqcur.fetchone()
+                if urow:
+                    user_score = urow[0]
+                    user_passed = True if (urow[1] == 'Y') else False
+                    user_taken = True
+                uqcur.close()
+            # get question count
+            qcur = conn.cursor()
+            qcur.execute("SELECT COUNT(*) FROM Questions WHERE quizID = :1", [quizID])
+            qc = qcur.fetchone()
+            question_count = int(qc[0]) if qc else 0
+            qcur.close()
+            quizzes.append({
+                'quizID': quizID,
+                'title': title,
+                'description': description,
+                'timelimit': timelimit,
+                'question_count': question_count,
+                'user_taken': user_taken,
+                'user_passed': user_passed,
+                'user_score': user_score
+            })
+        cur.close()
+        conn.close()
+        return jsonify({'ok': True, 'quizzes': quizzes}), 200
+    except Exception as e:
+        app.logger.exception('DB error fetching quizzes for users: %s', e)
+        return jsonify({'ok': False, 'message': 'Database error'}), 500
+
+
+@app.route('/api/quizzes/<int:quiz_id>/submit', methods=['POST'])
+def api_submit_quiz(quiz_id):
+    """Accept user's answers, grade the quiz, record Submissions and UserQuiz, and return score+passed.
+
+    Expected JSON: { answers: [ { questionID: <int>, answerID: <int> }, ... ] }
+    Pass criteria: score >= 50% of total points (simple default). Changeable later.
+    """
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer '):
+        return jsonify({'ok': False, 'message': 'Missing authorization token'}), 401
+    token = auth.split(' ', 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+    except Exception as e:
+        app.logger.debug('JWT decode error on submit quiz: %s', e)
+        return jsonify({'ok': False, 'message': 'Invalid or expired token'}), 401
+
+    if payload.get('role') == 'banned':
+        return jsonify({'ok': False, 'message': 'Banned users cannot submit quizzes'}), 403
+
+    user_id = payload.get('sub')
+    data = request.get_json() or {}
+    answers = data.get('answers') or []
+
+    if not isinstance(answers, list) or len(answers) == 0:
+        return jsonify({'ok': False, 'message': 'Answers required'}), 400
+
+    if not ORACLE_AVAILABLE:
+        return jsonify({'ok': False, 'message': 'Database not available'}), 503
+
+    try:
+        conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+        cur = conn.cursor()
+
+        # Prevent multiple submissions
+        cur.execute("SELECT 1 FROM UserQuiz WHERE quizID = :1 AND userID = :2", [quiz_id, user_id])
+        if cur.fetchone():
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Quiz already taken'}), 403
+
+        # Load questions and correct answers and points
+        qcur = conn.cursor()
+        qcur.execute("SELECT questionID, points FROM Questions WHERE quizID = :1", [quiz_id])
+        question_map = { int(r[0]): float(r[1] or 0) for r in qcur.fetchall() }
+        qcur.close()
+
+        # Load correct answerIDs per question
+        acur = conn.cursor()
+        acur.execute("SELECT questionID, answerID FROM Answers WHERE questionID IN (SELECT questionID FROM Questions WHERE quizID = :1) AND is_correct = 'Y'", [quiz_id])
+        correct_map = {}
+        for r in acur.fetchall():
+            qid = int(r[0]); aid = int(r[1])
+            correct_map.setdefault(qid, set()).add(aid)
+        acur.close()
+
+        # Grade
+        total_possible = sum(question_map.values())
+        earned = 0.0
+        per_question_results = []
+        for ans in answers:
+            qid = int(ans.get('questionID'))
+            aid = int(ans.get('answerID')) if ans.get('answerID') is not None else None
+            correct_set = correct_map.get(qid, set())
+            correct = (aid in correct_set)
+            pts = float(question_map.get(qid, 0))
+            if correct:
+                earned += pts
+            per_question_results.append({'questionID': qid, 'selected': aid, 'correct': bool(correct), 'points': pts})
+
+        # Determine pass threshold (50%)
+        passed = False
+        if total_possible <= 0:
+            # defensive: if no points set, pass if all answers correct
+            passed = all(p['correct'] for p in per_question_results)
+        else:
+            passed = (earned / total_possible) >= 0.5
+
+        # Insert Submissions rows
+        for p in per_question_results:
+            iscorr = 'Y' if p['correct'] else 'N'
+            try:
+                cur.execute("INSERT INTO Submissions (userID, questionID, iscorrect) VALUES (:1, :2, :3)", [user_id, p['questionID'], iscorr])
+            except Exception:
+                app.logger.exception('Failed to insert submission for question %s', p['questionID'])
+
+        # Insert UserQuiz row
+        try:
+            passed_flag = 'Y' if passed else 'N'
+            cur.execute("INSERT INTO UserQuiz (userID, quizID, score, passed) VALUES (:1, :2, :3, :4)", [user_id, quiz_id, earned, passed_flag])
+        except Exception:
+            app.logger.exception('Failed to insert UserQuiz row')
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return jsonify({'ok': True, 'score': earned, 'total': total_possible, 'passed': passed, 'details': per_question_results}), 200
+
+    except Exception as e:
+        app.logger.exception('Error submitting quiz: %s', e)
+        return jsonify({'ok': False, 'message': 'Database error while submitting quiz'}), 500
+
+
+@app.route('/api/quizzes/<int:quiz_id>/start', methods=['POST'])
+def api_start_quiz(quiz_id):
+    """Start a quiz for an authenticated user. Blocks if the user already took the quiz.
+    Returns quiz questions and answers (answers do NOT include is_correct) so the client can render the test.
+    """
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer '):
+        return jsonify({'ok': False, 'message': 'Missing authorization token'}), 401
+    token = auth.split(' ', 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+    except Exception as e:
+        app.logger.debug('JWT decode error on start quiz: %s', e)
+        return jsonify({'ok': False, 'message': 'Invalid or expired token'}), 401
+
+    if payload.get('role') == 'banned':
+        return jsonify({'ok': False, 'message': 'Banned users cannot take quizzes'}), 403
+
+    user_id = payload.get('sub')
+
+    if not ORACLE_AVAILABLE:
+        return jsonify({'ok': False, 'message': 'Database not available'}), 503
+
+    try:
+        conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+        cur = conn.cursor()
+        # check existence
+        cur.execute("SELECT 1 FROM UserQuiz WHERE quizID = :1 AND userID = :2", [quiz_id, user_id])
+        if cur.fetchone():
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Quiz already taken'}), 403
+
+        # fetch quiz basic info
+        cur.execute("SELECT quizID, title, description, timelimit FROM Quiz WHERE quizID = :1", [quiz_id])
+        qrow = cur.fetchone()
+        if not qrow:
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Quiz not found'}), 404
+        quizID, title, description, timelimit = qrow
+
+        # fetch questions and answers (without is_correct)
+        qcur = conn.cursor()
+        qcur.execute("SELECT questionID, title, category, difficulty, points, description FROM Questions WHERE quizID = :1 ORDER BY questionID", [quizID])
+        questions = []
+        for q in qcur.fetchall():
+            questionID, qtitle, qcategory, qdifficulty, qpoints, qdesc = q
+            acur = conn.cursor()
+            acur.execute("SELECT answerID, answer_text FROM Answers WHERE questionID = :1 ORDER BY answerID", [questionID])
+            answers = []
+            for a in acur.fetchall():
+                aid, atext = a
+                answers.append({'answerID': int(aid), 'text': atext})
+            acur.close()
+            questions.append({'questionID': int(questionID), 'title': qtitle, 'category': qcategory, 'difficulty': qdifficulty, 'points': qpoints, 'description': qdesc, 'answers': answers})
+        qcur.close()
+        cur.close()
+        conn.close()
+
+        return jsonify({'ok': True, 'quiz': {'quizID': quizID, 'title': title, 'description': description, 'timelimit': timelimit, 'questions': questions}}), 200
+    except Exception as e:
+        app.logger.exception('Error starting quiz: %s', e)
+        return jsonify({'ok': False, 'message': 'Database error while starting quiz'}), 500
     
 @app.route('/api/admin/quizzes', methods=['POST'])
 def api_admin_create_quiz():
