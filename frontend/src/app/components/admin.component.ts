@@ -22,9 +22,45 @@ import { HttpClient, HttpHeaders } from '@angular/common/http';
                 <div class="small-muted">Questions: {{ quiz.question_count || 0 }} | Time limit: {{ quiz.timelimit || 0 }} mins</div>
                 <div class="quiz-actions">
                   <button class="btn edit-btn" (click)="editQuiz(quiz.quizID)">Edit</button>
+                  <button class="btn results-btn" (click)="showResults(quiz.quizID)">Show Results</button>
                   <button class="btn delete-btn" (click)="deleteQuiz(quiz.quizID)">Delete</button>
                 </div>
               </div>
+                <!-- Results modal -->
+                <div class="modal-backdrop" *ngIf="showResultsModal">
+                  <div class="modal">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                      <h3>Results for: {{ resultsQuizTitle || 'Quiz' }}</h3>
+                      <button class="close" (click)="closeResults()">✕</button>
+                    </div>
+                    <div style="margin-top:12px;">
+                      <div *ngIf="results.length === 0">No results yet.</div>
+                      <table *ngIf="results.length > 0" style="width:100%; border-collapse:collapse; margin-top:8px;">
+                        <thead>
+                          <tr>
+                            <th style="text-align:left; padding:8px; border-bottom:1px solid #eee">Name</th>
+                            <th style="text-align:left; padding:8px; border-bottom:1px solid #eee">Email</th>
+                            <th style="text-align:left; padding:8px; border-bottom:1px solid #eee">Score</th>
+                            <th style="text-align:left; padding:8px; border-bottom:1px solid #eee">Passed</th>
+                            <th style="text-align:left; padding:8px; border-bottom:1px solid #eee">Taken At</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <tr *ngFor="let r of results">
+                            <td style="padding:8px; border-bottom:1px solid #fafafa">{{ r.name }}</td>
+                            <td style="padding:8px; border-bottom:1px solid #fafafa">{{ r.email }}</td>
+                            <td style="padding:8px; border-bottom:1px solid #fafafa">{{ r.score }} / {{ resultsTotal }}</td>
+                            <td style="padding:8px; border-bottom:1px solid #fafafa">{{ r.passed ? 'Yes' : 'No' }}</td>
+                            <td style="padding:8px; border-bottom:1px solid #fafafa">{{ r.taken_at }}</td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
+                    <div class="modal-actions" style="margin-top:12px;">
+                      <button class="btn edit-btn" (click)="closeResults()">Close</button>
+                    </div>
+                  </div>
+                </div>
             </div>
       </div>
       <!-- Quiz creation modal -->
@@ -312,12 +348,19 @@ import { HttpClient, HttpHeaders } from '@angular/common/http';
   .question-dot { width:34px; height:28px; border-radius:6px; border:1px solid #d9d9d9; background:#f6ffed; color:#262626; }
   .question-dot.active { background:#b7eb8f; border-color:#73d13d; font-weight:700 }
   .no-questions { color:#666; padding:0.6rem 0 }
+    .results-btn { background: #722ed1; color:#fff; border: none; padding: 0.3rem 0.9rem; border-radius:5px; font-weight:500; cursor:pointer }
+    .results-btn:hover { background:#531dab }
   `]
 })
 export class AdminComponent implements OnInit {
   quizzes: any[] = [];
   users: any[] = [];
   adminEmail: string = '';
+  // Results modal state
+  showResultsModal: boolean = false;
+  results: any[] = [];
+  resultsTotal: number = 0;
+  resultsQuizTitle: string = '';
 
   constructor(private http: HttpClient) {}
 
@@ -655,5 +698,32 @@ export class AdminComponent implements OnInit {
         alert('Failed to delete quiz');
       }
     });
+  }
+
+  showResults(quizID: number): void {
+    const token = localStorage.getItem('token');
+    const headers = token ? new HttpHeaders({ Authorization: `Bearer ${token}` }) : undefined;
+    this.http.get<any>(`/api/admin/quizzes/${quizID}/results`, { headers }).subscribe({
+      next: (res) => {
+        if (res && res.ok && Array.isArray(res.quiz_results)) {
+          this.results = res.quiz_results;
+          this.resultsTotal = res.total || 0;
+          const q = this.quizzes.find(qz => qz.quizID === quizID);
+          this.resultsQuizTitle = q ? q.title : '';
+          this.showResultsModal = true;
+        }
+      },
+      error: (err) => {
+        console.warn('Failed to fetch quiz results', err);
+        alert(err?.error?.message || 'Failed to fetch results');
+      }
+    });
+  }
+
+  closeResults(): void {
+    this.showResultsModal = false;
+    this.results = [];
+    this.resultsTotal = 0;
+    this.resultsQuizTitle = '';
   }
 }

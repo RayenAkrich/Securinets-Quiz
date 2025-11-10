@@ -21,10 +21,7 @@ import { Router } from '@angular/router';
           <div class="quiz-actions">
             <button *ngIf="!q.user_taken" class="btn take" (click)="takeQuiz(q.quizID)">Take Test</button>
             <div *ngIf="q.user_taken" class="taken">
-              Test already taken:
-              <span [ngClass]="{'passed': q.user_passed, 'failed': !q.user_passed}">
-                {{ q.user_passed ? ' Passed' : ' Failed' }}
-              </span>
+              Test already taken
               <span *ngIf="q.user_score !== null"> — Score: {{ q.user_score }}</span>
             </div>
           </div>
@@ -73,7 +70,6 @@ export class QuizzesComponent implements OnInit {
             timelimit: q.timelimit,
             question_count: q.question_count,
             user_taken: !!q.user_taken,
-            user_passed: !!q.user_passed,
             user_score: q.user_score ?? null
           }));
         }

@@ -63,10 +63,10 @@ interface QuizSession {
       </div>
     </div>
 
-    <!-- Result overlay after submission -->
+    <!-- Result overlay after submission (show only score to members) -->
     <div *ngIf="submitted && result" class="result-overlay">
       <div class="result-box">
-        <h2 [class.passed]="result.passed" [class.failed]="!result.passed">{{ result.passed ? 'Passed' : 'Failed' }}</h2>
+        <h2>Your Score</h2>
         <p>Score: {{ result.score }} / {{ result.total }}</p>
         <button class="btn" (click)="finishAfterSubmit()">Back to quizzes</button>
       </div>
@@ -269,7 +269,8 @@ export class TakeQuizComponent implements OnInit, OnDestroy {
       next: (res) => {
         if (res && res.ok) {
           this.submitted = true;
-          this.result = { score: res.score, total: res.total, passed: res.passed };
+          // Only expose numeric score and total to members — do not show pass/fail
+          this.result = { score: res.score, total: res.total };
           this.clearSession();
           this.clearTimer();
         }

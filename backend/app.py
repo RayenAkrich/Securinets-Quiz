@@ -363,6 +363,55 @@ def api_admin_delete_quiz(quiz_id):
         return jsonify({'ok': False, 'message': 'Database error while deleting quiz'}), 500
 
 
+@app.route('/api/admin/quizzes/<int:quiz_id>/results', methods=['GET'])
+def api_admin_quiz_results(quiz_id):
+    """Return per-user results for a quiz (admin only): userID, name, email, score, passed, taken_at and total possible points."""
+    try:
+        admin_payload = admin_required()
+    except Exception:
+        raise
+
+    if not ORACLE_AVAILABLE:
+        return jsonify({'ok': True, 'quiz_results': [], 'total': 0}), 200
+
+    try:
+        conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+        cur = conn.cursor()
+
+        # total possible points for this quiz
+        tcur = conn.cursor()
+        tcur.execute("SELECT NVL(SUM(points),0) FROM Questions WHERE quizID = :1", [quiz_id])
+        trow = tcur.fetchone()
+        total_possible = float(trow[0]) if trow and trow[0] is not None else 0.0
+        tcur.close()
+
+        # fetch per-user latest UserQuiz rows for this quiz
+        cur.execute(
+            "SELECT uq.userID, u.name, u.email, uq.score, uq.passed, uq.taken_at "
+            "FROM UserQuiz uq JOIN Users u ON uq.userID = u.userID "
+            "WHERE uq.quizID = :1 ORDER BY uq.taken_at DESC",
+            [quiz_id]
+        )
+        results = []
+        for row in cur.fetchall():
+            user_id, name, email, score, passed, taken_at = row
+            results.append({
+                'userID': int(user_id),
+                'name': name,
+                'email': email,
+                'score': float(score or 0),
+                'passed': True if passed == 'Y' else False,
+                'taken_at': str(taken_at)
+            })
+
+        cur.close()
+        conn.close()
+        return jsonify({'ok': True, 'quiz_results': results, 'total': total_possible}), 200
+    except Exception as e:
+        app.logger.exception('Error fetching quiz results: %s', e)
+        return jsonify({'ok': False, 'message': 'Database error while fetching quiz results'}), 500
+
+
 @app.route('/api/quizzes', methods=['GET'])
 def api_get_quizzes():
     """Return available quizzes to users. If an Authorization bearer token is provided,
@@ -416,7 +465,6 @@ def api_get_quizzes():
                 'timelimit': timelimit,
                 'question_count': question_count,
                 'user_taken': user_taken,
-                'user_passed': user_passed,
                 'user_score': user_score
             })
         cur.close()
@@ -524,7 +572,8 @@ def api_submit_quiz(quiz_id):
         cur.close()
         conn.close()
 
-        return jsonify({'ok': True, 'score': earned, 'total': total_possible, 'passed': passed, 'details': per_question_results}), 200
+        # Return score and details but do NOT expose the pass/fail boolean to members here
+        return jsonify({'ok': True, 'score': earned, 'total': total_possible, 'details': per_question_results}), 200
 
     except Exception as e:
         app.logger.exception('Error submitting quiz: %s', e)
