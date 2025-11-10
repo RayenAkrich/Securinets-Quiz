@@ -86,14 +86,15 @@ import { HttpClient, HttpHeaders } from '@angular/common/http';
           <!-- Question adding area: show a single question editor and a chooser wheel -->
           <div *ngIf="showQuestionForm">
             <div class="question-topbar">
-              <button class="btn edit-btn" (click)="prevQuestion()" [disabled]="newQuiz.questions.length === 0 || currentQuestionIndex === 0">◀</button>
-              <div class="question-wheel">
-                <button *ngFor="let q of newQuiz.questions; let i = index" class="question-dot" [class.active]="i === currentQuestionIndex" (click)="gotoQuestion(i)">{{ i + 1 }}</button>
+              <!-- prev/next placed absolutely top-left and top-right; wheel centered -->
+              <button class="btn edit-btn pager-prev" (click)="wheelPrevPage()" [disabled]="wheelPage === 0">◀</button>
+              <button class="btn edit-btn pager-next" (click)="wheelNextPage()" [disabled]="(wheelPage + 1) * WHEEL_VISIBLE >= (newQuiz.questions?.length || 0)">▶</button>
+              <div class="question-wheel-centered">
+                <div class="question-wheel">
+                  <button *ngFor="let q of visibleQuestions(); let i = index" class="question-dot" [class.active]="(wheelPage * WHEEL_VISIBLE + i) === currentQuestionIndex" (click)="gotoQuestion(wheelPage * WHEEL_VISIBLE + i)">{{ (wheelPage * WHEEL_VISIBLE + i) + 1 }}</button>
+                </div>
               </div>
-              <div style="display:flex; gap:0.6rem; align-items:center;">
-                <button class="btn edit-btn" (click)="createNewQuestionAndEdit()">＋</button>
-                <button class="btn edit-btn" (click)="nextQuestion()" [disabled]="currentQuestionIndex >= newQuiz.questions.length - 1">▶</button>
-              </div>
+              <button class="btn edit-btn add-question-btn" (click)="createNewQuestionAndEdit()">＋</button>
             </div>
 
             <div *ngIf="newQuiz.questions.length === 0 && !showQuestionInputs" class="no-questions">
@@ -343,8 +344,12 @@ import { HttpClient, HttpHeaders } from '@angular/common/http';
     .answers-block { margin-top: 0.6rem }
     .answer-row { display:flex; justify-content:space-between; align-items:center; gap:0.6rem; padding:0.2rem 0 }
     .add-answer-row { display:flex; gap:0.5rem; align-items:center; margin-top:0.6rem }
-  .question-topbar { display:flex; align-items:center; gap:0.6rem; justify-content:space-between; margin-bottom:0.6rem }
-  .question-wheel { display:flex; gap:0.4rem; align-items:center; justify-content:center; flex:1 }
+  .question-topbar { position: relative; padding: 1.6rem 0.8rem 0.6rem 0.8rem; margin-bottom:0.6rem }
+  .pager-prev { position: absolute; left: 12px; top: 8px; }
+  .pager-next { position: absolute; right: 12px; top: 8px; }
+  .add-question-btn { position: absolute; right: 54px; top: 8px; margin-right: 20px; }
+  .question-wheel-centered { display:flex; justify-content:center; width:100%; }
+  .question-wheel { display:flex; gap:0.4rem; align-items:center; justify-content:center; }
   .question-dot { width:34px; height:28px; border-radius:6px; border:1px solid #d9d9d9; background:#f6ffed; color:#262626; }
   .question-dot.active { background:#b7eb8f; border-color:#73d13d; font-weight:700 }
   .no-questions { color:#666; padding:0.6rem 0 }
@@ -422,6 +427,9 @@ export class AdminComponent implements OnInit {
   currentAnswer: any = { text: '', is_correct: false };
   currentQuestionIndex: number = 0;
   editingExisting: boolean = false;
+  // wheel pagination for admin question editor
+  readonly WHEEL_VISIBLE = 7;
+  wheelPage = 0;
 
   openQuizModal(): void {
     this.showQuizModal = true;
@@ -502,12 +510,30 @@ export class AdminComponent implements OnInit {
     this.currentQuestionIndex = this.newQuiz.questions.length;
   }
 
+  visibleQuestions(): any[] {
+    if (!this.newQuiz || !Array.isArray(this.newQuiz.questions)) return [];
+    const start = this.wheelPage * this.WHEEL_VISIBLE;
+    return (this.newQuiz.questions || []).slice(start, start + this.WHEEL_VISIBLE);
+  }
+
+  wheelPrevPage(): void {
+    if (this.wheelPage > 0) this.wheelPage--;
+  }
+
+  wheelNextPage(): void {
+    const total = (this.newQuiz && Array.isArray(this.newQuiz.questions)) ? this.newQuiz.questions.length : 0;
+    const maxPage = Math.max(0, Math.ceil(total / this.WHEEL_VISIBLE) - 1);
+    if (this.wheelPage < maxPage) this.wheelPage++;
+  }
+
   gotoQuestion(i: number): void {
     if (i < 0 || i >= this.newQuiz.questions.length) return;
     this.currentQuestionIndex = i;
     this.currentQuestion = this.newQuiz.questions[i];
     this.editingExisting = true;
     this.showQuestionInputs = true;
+    // ensure wheel page contains the selected question
+    this.wheelPage = Math.floor(i / this.WHEEL_VISIBLE);
   }
 
   prevQuestion(): void {

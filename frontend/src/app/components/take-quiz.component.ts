@@ -8,6 +8,7 @@ interface QuizSession {
   quizID: number;
   startAt: number; // epoch ms
   expiresAt?: number; // epoch ms
+  sessionId?: string;
   answersMap: { [questionID: number]: number | null };
   currentIndex: number;
 }
@@ -24,19 +25,23 @@ interface QuizSession {
     <div class="modal-backdrop" *ngIf="quiz">
       <div class="modal">
         <div class="modal-header">
-          <button class="nav-left" (click)="prevQuestion()">◀</button>
+          <button class="nav-left" (click)="prevQuestion()">◀ Back</button>
           <h3 class="modal-title">{{ quiz.title }}</h3>
-          <button class="nav-right" (click)="nextQuestion()">▶</button>
+          <button class="nav-right" (click)="nextQuestion()">Next ▶</button>
           <div class="timer" *ngIf="hasTimer">{{ timeLeftDisplay }}</div>
+          <div class="expired-banner" *ngIf="sessionExpired" title="Session expired">Session expired</div>
           <button class="close" (click)="closeModal()">✕</button>
         </div>
 
         <div class="modal-body">
-          <p class="muted">{{ quiz.description }}</p>
 
           <div class="question-topbar centered">
-            <div class="question-wheel">
-              <button *ngFor="let q of quiz.questions; let i = index" class="question-dot" [class.active]="i === session.currentIndex" (click)="gotoQuestion(i)">{{ i + 1 }}</button>
+            <button class="btn pager-prev" (click)="wheelPrevPage()" [disabled]="wheelPage === 0">◀</button>
+            <button class="btn pager-next" (click)="wheelNextPage()" [disabled]="(wheelPage + 1) * WHEEL_VISIBLE >= (quiz.questions?.length || 0)">▶</button>
+            <div class="question-wheel-centered">
+              <div class="question-wheel">
+                <button *ngFor="let q of visibleQuestions(); let i = index" class="question-dot" [class.active]="(wheelPage * WHEEL_VISIBLE + i) === session.currentIndex" [class.saved]="savedAnswers[q.questionID]" (click)="gotoQuestion(wheelPage * WHEEL_VISIBLE + i)">{{ (wheelPage * WHEEL_VISIBLE + i) + 1 }}</button>
+              </div>
             </div>
           </div>
 
@@ -57,7 +62,9 @@ interface QuizSession {
             <button class="btn" (click)="saveAndClose()">Close</button>
           </div>
           <div class="right">
-            <button class="btn submit" (click)="onSubmitClick()">Submit</button>
+                <button class="btn submit" (click)="confirmOrSubmit()" [disabled]="sessionExpired || isSaving">
+                  {{ isLastQuestion() ? 'Submit Quiz' : (isSaving ? 'Saving...' : 'Confirm Question') }}
+                </button>
           </div>
         </div>
       </div>
@@ -82,12 +89,18 @@ interface QuizSession {
     .nav-right { right:48px }
     .close { position:absolute; right:12px; top:8px; background:transparent; border:none; font-size:1.1rem; cursor:pointer }
     .timer { position:absolute; right:72px; top:10px; font-weight:600; color:#fa541c }
+  .timer { z-index: 20; font-size: 0.95rem }
+    .expired-banner { position:absolute; right:12px; top:12px; color:#a8071a; font-weight:700; background: rgba(255,240,240,0.9); padding:4px 8px; border-radius:6px; border:1px solid rgba(168,7,26,0.12) }
 
     .modal-body { padding:16px }
-    .question-topbar.centered { display:flex; justify-content:center; margin-bottom:12px }
+    .question-topbar.centered { position: relative; padding: 12px 8px 6px 8px; margin-bottom:12px }
+    .pager-prev { position: absolute; left: 8px; top: 8px; background: transparent; border: none; font-size:1rem; cursor:pointer; padding:6px 8px }
+    .pager-next { position: absolute; right: 8px; top: 8px; background: transparent; border: none; font-size:1rem; cursor:pointer; padding:6px 8px }
+    .question-wheel-centered { display:flex; justify-content:center; width:100% }
     .question-wheel { display:flex; gap:6px; flex-wrap:wrap; justify-content:center }
-    .question-dot { min-width:34px; height:34px; border-radius:6px; border:1px solid #d9d9d9; background:#f6ffed; color:#262626; font-weight:600 }
-    .question-dot.active { background:#b7eb8f; border-color:#73d13d }
+  .question-dot { min-width:34px; height:34px; border-radius:6px; border:1px solid #d9d9d9; background:#f6ffed; color:#262626; font-weight:600 }
+  .question-dot.active { background:#b7eb8f; border-color:#73d13d }
+  .question-dot.saved { box-shadow: inset 0 0 0 3px rgba(24,144,255,0.06); }
 
     .question-area { padding:8px 4px }
     .q-title { font-weight:700; margin-bottom:6px }
@@ -113,8 +126,16 @@ export class TakeQuizComponent implements OnInit, OnDestroy {
   timerHandle: any = null;
   timeLeftDisplay = '';
   hasTimer = false;
+  sessionExpired = false;
+  readonly GRACE_MS = 5000; // 5 seconds grace window to tolerate clock skew/race
   submitted = false;
   result: any = null;
+  // track per-question saved state
+  savedAnswers: { [questionID: number]: boolean } = {};
+  isSaving: boolean = false;
+  // Question wheel pagination
+  readonly WHEEL_VISIBLE = 7;
+  wheelPage = 0;
 
   constructor(private http: HttpClient, private route: ActivatedRoute, private router: Router) {}
 
@@ -123,6 +144,51 @@ export class TakeQuizComponent implements OnInit, OnDestroy {
     if (!id) return;
     this.loadOrStartSession(id);
     window.addEventListener('beforeunload', this.beforeUnload);
+  }
+
+  // Normalize session.expiresAt to a numeric epoch-ms value when possible
+  normalizeSessionTimestamps(serverSession: any | null, sessionObj: QuizSession): void {
+    // Prefer server-provided epoch-ms fields
+    try {
+      // If server provides both server_now_ms and expires_at_ms, compute remaining on server and translate into a client epoch-ms
+      if (serverSession && typeof serverSession.server_now_ms !== 'undefined' && typeof serverSession.expires_at_ms !== 'undefined') {
+        const serverNow = Number(serverSession.server_now_ms);
+        const expiresAtMs = Number(serverSession.expires_at_ms);
+        if (!isNaN(serverNow) && !isNaN(expiresAtMs)) {
+          const remaining = expiresAtMs - serverNow;
+          if (remaining > 0) {
+            // set client's expiresAt to local now + remaining to compensate clock skew
+            sessionObj.expiresAt = Date.now() + remaining;
+            return;
+          } else {
+            sessionObj.expiresAt = undefined as any;
+            return;
+          }
+        }
+      }
+
+      // fallback: try numeric expires_at_ms or parse ISO expires_at
+      let expires: any = null;
+      if (serverSession && (serverSession.expires_at_ms || serverSession.expires_at)) {
+        if (serverSession.expires_at_ms) expires = Number(serverSession.expires_at_ms);
+        else expires = Date.parse(serverSession.expires_at);
+      } else if (sessionObj && typeof sessionObj.expiresAt !== 'undefined') {
+        expires = sessionObj.expiresAt;
+      }
+
+      if (typeof expires === 'string') expires = Number(expires);
+      if (typeof expires === 'number' && !isNaN(expires)) {
+        // if it's in seconds (10-digit), convert to ms
+        if (expires < 1e12) expires = expires * 1000;
+        sessionObj.expiresAt = expires;
+      } else {
+        // leave undefined if invalid
+        sessionObj.expiresAt = undefined as any;
+      }
+    } catch (e) {
+      console.warn('Failed to normalize session timestamps', e);
+      sessionObj.expiresAt = undefined as any;
+    }
   }
 
   ngOnDestroy(): void {
@@ -156,21 +222,67 @@ export class TakeQuizComponent implements OnInit, OnDestroy {
         if (res && res.ok && res.quiz) {
           this.quiz = res.quiz;
           // initialize session if missing
+          const now = Date.now();
+          const serverSession = res.session || null;
           if (!this.session || this.session.quizID !== this.quiz.quizID) {
-            const now = Date.now();
-            const expiresAt = this.quiz.timelimit && this.quiz.timelimit > 0 ? now + this.quiz.timelimit * 60 * 1000 : undefined;
-            this.session = { quizID: this.quiz.quizID, startAt: now, expiresAt, answersMap: {}, currentIndex: 0 };
+            // Build new session from server data if present
+            let startAt = now;
+            let expiresAt = this.quiz.timelimit && this.quiz.timelimit > 0 ? now + this.quiz.timelimit * 60 * 1000 : undefined;
+            let sessionId: string | undefined = undefined;
+            if (serverSession) {
+              sessionId = serverSession.session_id || serverSession.sessionId || undefined;
+              // prefer numeric epoch-ms fields if provided by the server
+              if (serverSession.start_at_ms) startAt = Number(serverSession.start_at_ms);
+              else if (serverSession.start_at) startAt = Date.parse(serverSession.start_at) || startAt;
+              if (serverSession.expires_at_ms) expiresAt = Number(serverSession.expires_at_ms);
+              else if (serverSession.expires_at) expiresAt = Date.parse(serverSession.expires_at) || expiresAt;
+            }
+            this.session = { quizID: this.quiz.quizID, startAt, expiresAt, sessionId, answersMap: {}, currentIndex: 0 };
+            // normalize numeric/iso/seconds timestamps into epoch-ms
+            this.normalizeSessionTimestamps(serverSession, this.session);
+            // If server didn't provide a valid expiresAt but quiz timelimit exists, derive expiresAt from startAt
+            if (!(this.session && typeof this.session.expiresAt === 'number' && isFinite(this.session.expiresAt)) && this.quiz && this.quiz.timelimit) {
+              const start = (this.session && typeof this.session.startAt === 'number') ? this.session.startAt : Date.now();
+              try { this.session.expiresAt = start + (Number(this.quiz.timelimit) * 60 * 1000); } catch (e) { /* ignore */ }
+            }
             (this.quiz.questions || []).forEach((q: any) => this.session.answersMap[q.questionID] = null);
             this.saveSession();
           } else {
-            // ensure answers map has all keys
+            // ensure answers map has all keys; also update sessionId/expiry from server if provided
+            if (serverSession) {
+              this.session.sessionId = serverSession.session_id || serverSession.sessionId || this.session.sessionId;
+                // normalize session timestamps (will set expiresAt appropriately)
+                this.normalizeSessionTimestamps(serverSession, this.session);
+                // If server didn't provide a valid expiresAt but quiz timelimit exists, derive expiresAt from startAt
+                if (!(this.session && typeof this.session.expiresAt === 'number' && isFinite(this.session.expiresAt)) && this.quiz && this.quiz.timelimit) {
+                  const start = (this.session && typeof this.session.startAt === 'number') ? this.session.startAt : Date.now();
+                  try { this.session.expiresAt = start + (Number(this.quiz.timelimit) * 60 * 1000); } catch (e) { /* ignore */ }
+                }
+            }
             (this.quiz.questions || []).forEach((q: any) => {
               if (!(q.questionID in this.session.answersMap)) this.session.answersMap[q.questionID] = null;
             });
+            this.saveSession();
           }
 
-          this.hasTimer = !!(this.session.expiresAt);
-          if (this.hasTimer) this.startTimer();
+          // debug: print session to console for troubleshooting
+          try { console.debug('TakeQuiz session after start:', JSON.parse(JSON.stringify(this.session))); } catch (e) {}
+
+          // Start timer only when expiresAt is valid; support a small grace window so tiny clock skew doesn't immediately expire the UI.
+          if (this.session && typeof this.session.expiresAt === 'number' && isFinite(this.session.expiresAt)) {
+            const remaining = this.session.expiresAt - Date.now();
+            this.sessionExpired = remaining <= -this.GRACE_MS;
+            this.hasTimer = remaining > -this.GRACE_MS; // show timer even for small negative remaining within grace window
+          } else {
+            this.sessionExpired = false;
+            this.hasTimer = false;
+          }
+          console.debug('hasTimer:', this.hasTimer, 'sessionExpired:', this.sessionExpired, 'expiresAt:', this.session && this.session.expiresAt, 'now:', Date.now());
+          if (this.hasTimer) {
+            // set initial display immediately and start interval
+            this.updateTimeLeft();
+            this.startTimer();
+          }
         }
         this.loading = false;
       },
@@ -203,14 +315,17 @@ export class TakeQuizComponent implements OnInit, OnDestroy {
   }
 
   updateTimeLeft(): void {
-    if (!this.session || !this.session.expiresAt) return;
+    if (!this.session || typeof this.session.expiresAt !== 'number' || !isFinite(this.session.expiresAt)) return;
     const now = Date.now();
-    let diff = Math.max(0, this.session.expiresAt - now);
+    const diffRaw = this.session.expiresAt - now;
+    const diff = Math.max(0, diffRaw);
     const mins = Math.floor(diff / 60000);
     const secs = Math.floor((diff % 60000) / 1000);
     this.timeLeftDisplay = `${mins.toString().padStart(2,'0')}:${secs.toString().padStart(2,'0')}`;
-    if (diff <= 0) {
-      // time up -> auto-submit
+    // Update sessionExpired in case it falls past the grace window while viewing
+    this.sessionExpired = diffRaw <= -this.GRACE_MS;
+    // Only auto-submit when we've passed the grace window (so tiny skews don't auto-submit immediately)
+    if (diffRaw <= -this.GRACE_MS) {
       this.clearTimer();
       this.autoSubmit();
     }
@@ -233,6 +348,8 @@ export class TakeQuizComponent implements OnInit, OnDestroy {
       }
     }
     this.session.currentIndex = i;
+    // ensure wheel page contains the selected question
+    this.wheelPage = Math.floor(i / this.WHEEL_VISIBLE);
     this.saveSession();
   }
 
@@ -253,6 +370,55 @@ export class TakeQuizComponent implements OnInit, OnDestroy {
     this.submit();
   }
 
+  // New flow: confirm/save current question to server. If last question, this will submit the quiz.
+  confirmOrSubmit(): void {
+    if (!this.quiz || !this.currentQuestion) return;
+    if (this.isLastQuestion()) {
+      // Save current question first, then submit on success/fallback
+      this.confirmQuestion(() => this.submit());
+    } else {
+      this.confirmQuestion();
+    }
+  }
+
+  isLastQuestion(): boolean {
+    return !!(this.quiz && this.session && this.session.currentIndex === (this.quiz.questions?.length - 1));
+  }
+
+  confirmQuestion(onSaved?: () => void): void {
+    if (!this.quiz || !this.currentQuestion || !this.session) return;
+    const q = this.currentQuestion;
+    const qid = q.questionID;
+    const answerID = this.session.answersMap[qid] ?? null;
+    // If no answer selected, ask user to confirm saving empty answer
+    if (answerID === null) {
+      const ok = confirm('You have not selected an answer for this question. Save empty answer?');
+      if (!ok) return;
+    }
+    this.isSaving = true;
+    const payload: any = { questionID: qid, answerID };
+    if (this.session && this.session.sessionId) payload.session_id = this.session.sessionId;
+    const token = localStorage.getItem('token');
+    const headers = token ? new HttpHeaders({ Authorization: `Bearer ${token}` }) : undefined;
+    // Try server-side per-question save endpoint. If it fails, fall back to local save.
+    this.http.post<any>(`/api/quizzes/${this.quiz.quizID}/answer`, payload, { headers }).subscribe({
+      next: (res) => {
+        this.savedAnswers[qid] = true;
+        this.isSaving = false;
+        this.saveSession();
+        if (onSaved) onSaved();
+      },
+      error: (err) => {
+        console.warn('Per-question save failed, saving locally', err);
+        // fallback: mark as saved locally so user can continue; final submit will still send all answers
+        this.savedAnswers[qid] = true;
+        this.isSaving = false;
+        this.saveSession();
+        if (onSaved) onSaved();
+      }
+    });
+  }
+
   autoSubmit(): void {
     // submit automatically using current answers (null treated as no answer)
     alert('Time is up. Submitting your answers.');
@@ -262,7 +428,8 @@ export class TakeQuizComponent implements OnInit, OnDestroy {
   submit(): void {
     if (!this.quiz) return;
     const answersPayload = (this.quiz.questions || []).map((q: any) => ({ questionID: q.questionID, answerID: this.session.answersMap[q.questionID] }));
-    const payload = { answers: answersPayload };
+    const payload: any = { answers: answersPayload };
+    if (this.session && this.session.sessionId) payload.session_id = this.session.sessionId;
     const token = localStorage.getItem('token');
     const headers = token ? new HttpHeaders({ Authorization: `Bearer ${token}` }) : undefined;
     this.http.post<any>(`/api/quizzes/${this.quiz.quizID}/submit`, payload, { headers }).subscribe({
@@ -285,5 +452,23 @@ export class TakeQuizComponent implements OnInit, OnDestroy {
   finishAfterSubmit(): void {
     // navigate back to quizzes and allow list to refresh
     this.router.navigate(['/quizzes']);
+  }
+
+  visibleQuestions(): any[] {
+    if (!this.quiz || !Array.isArray(this.quiz.questions)) return [];
+    const start = this.wheelPage * this.WHEEL_VISIBLE;
+    return (this.quiz.questions || []).slice(start, start + this.WHEEL_VISIBLE);
+  }
+
+  wheelPrevPage(): void {
+    if (this.wheelPage > 0) {
+      this.wheelPage--;
+    }
+  }
+
+  wheelNextPage(): void {
+    const total = (this.quiz && Array.isArray(this.quiz.questions)) ? this.quiz.questions.length : 0;
+    const maxPage = Math.max(0, Math.ceil(total / this.WHEEL_VISIBLE) - 1);
+    if (this.wheelPage < maxPage) this.wheelPage++;
   }
 }

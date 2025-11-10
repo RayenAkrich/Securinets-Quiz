@@ -9,6 +9,7 @@ from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 from datetime import datetime, timedelta
+import uuid
 try:
     import oracledb  # optional: may not be installed in dev
     ORACLE_AVAILABLE = True
@@ -498,6 +499,9 @@ def api_submit_quiz(quiz_id):
     user_id = payload.get('sub')
     data = request.get_json() or {}
     answers = data.get('answers') or []
+    session_id = data.get('session_id')
+    if not session_id:
+        return jsonify({'ok': False, 'message': 'session_id is required'}), 400
 
     if not isinstance(answers, list) or len(answers) == 0:
         return jsonify({'ok': False, 'message': 'Answers required'}), 400
@@ -509,7 +513,38 @@ def api_submit_quiz(quiz_id):
         conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
         cur = conn.cursor()
 
-        # Prevent multiple submissions
+        # Validate session
+        scur = conn.cursor()
+        scur.execute("SELECT userID, quizID, status, expires_at FROM Sessions WHERE session_id = :1", [session_id])
+        srow = scur.fetchone()
+        scur.close()
+        if not srow:
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Invalid session'}), 400
+        s_userid, s_quizid, s_status, s_expires = srow
+        if int(s_userid) != int(user_id) or int(s_quizid) != int(quiz_id):
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Session does not belong to this user/quiz'}), 403
+        if s_status != 'active':
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Session is not active'}), 403
+        if s_expires is not None and datetime.utcnow() > s_expires:
+            # expire the session
+            try:
+                ucur = conn.cursor()
+                ucur.execute("UPDATE Sessions SET status = 'expired', updated_at = :1 WHERE session_id = :2", [datetime.utcnow(), session_id])
+                conn.commit()
+                ucur.close()
+            except Exception:
+                app.logger.exception('Failed to mark session expired')
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Session expired'}), 403
+
+        # Prevent multiple submissions (still guard by DB UserQuiz)
         cur.execute("SELECT 1 FROM UserQuiz WHERE quizID = :1 AND userID = :2", [quiz_id, user_id])
         if cur.fetchone():
             cur.close()
@@ -568,6 +603,15 @@ def api_submit_quiz(quiz_id):
         except Exception:
             app.logger.exception('Failed to insert UserQuiz row')
 
+        # Update session record as submitted
+        try:
+            ucur = conn.cursor()
+            ucur.execute("UPDATE Sessions SET status = 'submitted', score = :1, submitted_at = :2, updated_at = :3 WHERE session_id = :4",
+                         [earned, datetime.utcnow(), datetime.utcnow(), session_id])
+            ucur.close()
+        except Exception:
+            app.logger.exception('Failed to update session after submit')
+
         conn.commit()
         cur.close()
         conn.close()
@@ -578,6 +622,94 @@ def api_submit_quiz(quiz_id):
     except Exception as e:
         app.logger.exception('Error submitting quiz: %s', e)
         return jsonify({'ok': False, 'message': 'Database error while submitting quiz'}), 500
+
+
+@app.route('/api/quizzes/<int:quiz_id>/answer', methods=['POST'])
+def api_save_answer(quiz_id):
+    """Save a single question answer for the current session.
+    Expected JSON: { questionID: <int>, answerID: <int|null>, session_id: <uuid string> }
+    This upserts into SessionAnswers and returns ok=True on success.
+    """
+    auth = request.headers.get('Authorization', '')
+    if not auth.startswith('Bearer '):
+        return jsonify({'ok': False, 'message': 'Missing authorization token'}), 401
+    token = auth.split(' ', 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+    except Exception as e:
+        app.logger.debug('JWT decode error on save answer: %s', e)
+        return jsonify({'ok': False, 'message': 'Invalid or expired token'}), 401
+
+    if payload.get('role') == 'banned':
+        return jsonify({'ok': False, 'message': 'Banned users cannot save answers'}), 403
+
+    user_id = payload.get('sub')
+    data = request.get_json() or {}
+    question_id = data.get('questionID')
+    answer_id = data.get('answerID') if ('answerID' in data) else None
+    session_id = data.get('session_id')
+
+    if not session_id or not question_id:
+        return jsonify({'ok': False, 'message': 'session_id and questionID are required'}), 400
+
+    if not ORACLE_AVAILABLE:
+        return jsonify({'ok': False, 'message': 'Database not available'}), 503
+
+    try:
+        conn = oracledb.connect(user=DB_USER, password=DB_PASS, dsn=DB_DSN)
+        cur = conn.cursor()
+
+        # validate session
+        scur = conn.cursor()
+        scur.execute("SELECT userID, quizID, status, expires_at FROM Sessions WHERE session_id = :1", [session_id])
+        srow = scur.fetchone()
+        scur.close()
+        if not srow:
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Invalid session'}), 400
+        s_userid, s_quizid, s_status, s_expires = srow
+        if int(s_userid) != int(user_id) or int(s_quizid) != int(quiz_id):
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Session does not belong to this user/quiz'}), 403
+        if s_status != 'active':
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Session is not active'}), 403
+        if s_expires is not None and datetime.utcnow() > s_expires:
+            try:
+                ucur = conn.cursor()
+                ucur.execute("UPDATE Sessions SET status = 'expired', updated_at = :1 WHERE session_id = :2", [datetime.utcnow(), session_id])
+                conn.commit()
+                ucur.close()
+            except Exception:
+                app.logger.exception('Failed to mark session expired')
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Session expired'}), 403
+
+        # Upsert into SessionAnswers (update first, insert if no rows updated)
+        try:
+            now = datetime.utcnow()
+            # Update
+            cur.execute("UPDATE SessionAnswers SET answerID = :1, updated_at = :2 WHERE session_id = :3 AND questionID = :4", [answer_id, now, session_id, question_id])
+            if cur.rowcount == 0:
+                # Insert
+                cur.execute("INSERT INTO SessionAnswers (session_id, userID, quizID, questionID, answerID, created_at, updated_at) VALUES (:1,:2,:3,:4,:5,:6,:7)", [session_id, user_id, quiz_id, question_id, answer_id, now, now])
+            conn.commit()
+        except Exception:
+            app.logger.exception('Failed to upsert SessionAnswers')
+            cur.close()
+            conn.close()
+            return jsonify({'ok': False, 'message': 'Failed to save answer'}), 500
+
+        cur.close()
+        conn.close()
+        return jsonify({'ok': True}), 200
+    except Exception as e:
+        app.logger.exception('Error saving answer: %s', e)
+        return jsonify({'ok': False, 'message': 'Database error while saving answer'}), 500
 
 
 @app.route('/api/quizzes/<int:quiz_id>/start', methods=['POST'])
@@ -621,6 +753,60 @@ def api_start_quiz(quiz_id):
             conn.close()
             return jsonify({'ok': False, 'message': 'Quiz not found'}), 404
         quizID, title, description, timelimit = qrow
+        # Create or resume a server-side session to enforce the timer
+        # Accept optional "force" flag in request body or query string to create a new session even if an old one exists
+        force = False
+        try:
+            body = request.get_json(silent=True) or {}
+            if isinstance(body, dict) and body.get('force'):
+                force = True
+        except Exception:
+            force = False
+        # also accept ?force=true
+        if request.args.get('force') in ('1', 'true', 'True'):
+            force = True
+
+        scur = conn.cursor()
+        try:
+            # If not forcing, try to find an active session
+            if not force:
+                scur.execute("SELECT session_id, start_at, expires_at, status FROM Sessions WHERE userID = :1 AND quizID = :2 AND status = 'active' ORDER BY start_at DESC", [user_id, quizID])
+                srow = scur.fetchone()
+            else:
+                srow = None
+
+            if srow:
+                session_id = srow[0]
+                start_at = srow[1]
+                expires_at = srow[2]
+            else:
+                # If forcing, expire any existing active sessions first
+                if force:
+                    try:
+                        scur.execute("UPDATE Sessions SET status='expired', updated_at = :1 WHERE userID = :2 AND quizID = :3 AND status = 'active'", [datetime.utcnow(), user_id, quizID])
+                        conn.commit()
+                    except Exception:
+                        app.logger.exception('Failed to expire existing sessions during force start')
+
+                session_id = str(uuid.uuid4())
+                start_at = datetime.utcnow()
+                expires_at = None
+                try:
+                    if timelimit is not None:
+                        expires_at = start_at + timedelta(minutes=int(timelimit))
+                except Exception:
+                    expires_at = None
+                # Insert session
+                try:
+                    scur.execute(
+                        "INSERT INTO Sessions (session_id, userID, quizID, start_at, expires_at, status, client_ip, user_agent, created_at, updated_at) VALUES (:1,:2,:3,:4,:5,:6,:7,:8,:9,:10)",
+                        [session_id, user_id, quizID, start_at, expires_at, 'active', request.remote_addr, request.headers.get('User-Agent'), datetime.utcnow(), datetime.utcnow()]
+                    )
+                    conn.commit()
+                except Exception:
+                    app.logger.exception('Failed to create session')
+        finally:
+            scur.close()
 
         # fetch questions and answers (without is_correct)
         qcur = conn.cursor()
@@ -640,7 +826,32 @@ def api_start_quiz(quiz_id):
         cur.close()
         conn.close()
 
-        return jsonify({'ok': True, 'quiz': {'quizID': quizID, 'title': title, 'description': description, 'timelimit': timelimit, 'questions': questions}}), 200
+        # Return session info with both ISO strings and epoch-ms fields for robustness
+        session_info = {'session_id': session_id}
+        try:
+            session_info['start_at'] = start_at.isoformat() if start_at else None
+            session_info['expires_at'] = expires_at.isoformat() if expires_at else None
+            session_info['start_at_ms'] = int(start_at.timestamp() * 1000) if start_at else None
+            session_info['expires_at_ms'] = int(expires_at.timestamp() * 1000) if expires_at else None
+            # include server's current time in ms to allow clients to compensate for clock skew
+            session_info['server_now_ms'] = int(datetime.utcnow().timestamp() * 1000)
+        except Exception:
+            session_info['start_at'] = str(start_at) if start_at else None
+            session_info['expires_at'] = str(expires_at) if expires_at else None
+            try:
+                session_info['start_at_ms'] = int(start_at.timestamp() * 1000) if start_at else None
+            except Exception:
+                session_info['start_at_ms'] = None
+            try:
+                session_info['expires_at_ms'] = int(expires_at.timestamp() * 1000) if expires_at else None
+            except Exception:
+                session_info['expires_at_ms'] = None
+            try:
+                session_info['server_now_ms'] = int(datetime.utcnow().timestamp() * 1000)
+            except Exception:
+                session_info['server_now_ms'] = None
+
+        return jsonify({'ok': True, 'quiz': {'quizID': quizID, 'title': title, 'description': description, 'timelimit': timelimit, 'questions': questions}, 'session': session_info}), 200
     except Exception as e:
         app.logger.exception('Error starting quiz: %s', e)
         return jsonify({'ok': False, 'message': 'Database error while starting quiz'}), 500
