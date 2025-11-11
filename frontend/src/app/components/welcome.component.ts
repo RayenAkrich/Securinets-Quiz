@@ -40,7 +40,7 @@ import { RouterLink } from '@angular/router';
       </div>
     </section>
 
-    <footer class="site-footer">
+  <footer id="site-footer" class="site-footer">
       <div class="footer-grid">
         <div class="footer-brand">
           <div class="brand-head">

@@ -25,9 +25,7 @@ interface QuizSession {
     <div class="modal-backdrop" *ngIf="quiz">
       <div class="modal">
         <div class="modal-header">
-          <button class="nav-left" (click)="prevQuestion()">◀ Back</button>
           <h3 class="modal-title">{{ quiz.title }}</h3>
-          <button class="nav-right" (click)="nextQuestion()">Next ▶</button>
           <div class="timer" *ngIf="hasTimer">{{ timeLeftDisplay }}</div>
           <div class="expired-banner" *ngIf="sessionExpired" title="Session expired">Session expired</div>
           <button class="close" (click)="closeModal()">✕</button>
@@ -88,7 +86,7 @@ interface QuizSession {
     .nav-left { left:12px }
     .nav-right { right:48px }
     .close { position:absolute; right:12px; top:8px; background:transparent; border:none; font-size:1.1rem; cursor:pointer }
-    .timer { position:absolute; right:72px; top:10px; font-weight:600; color:#fa541c }
+    .timer { position:absolute; right:702px; top:10px; font-weight:600; color:#fa541c }
   .timer { z-index: 20; font-size: 0.95rem }
     .expired-banner { position:absolute; right:12px; top:12px; color:#a8071a; font-weight:700; background: rgba(255,240,240,0.9); padding:4px 8px; border-radius:6px; border:1px solid rgba(168,7,26,0.12) }
 
@@ -271,8 +269,10 @@ export class TakeQuizComponent implements OnInit, OnDestroy {
           // Start timer only when expiresAt is valid; support a small grace window so tiny clock skew doesn't immediately expire the UI.
           if (this.session && typeof this.session.expiresAt === 'number' && isFinite(this.session.expiresAt)) {
             const remaining = this.session.expiresAt - Date.now();
-            this.sessionExpired = remaining <= -this.GRACE_MS;
-            this.hasTimer = remaining > -this.GRACE_MS; // show timer even for small negative remaining within grace window
+            // consider the session expired once we've reached the expiry (<= 0)
+            this.sessionExpired = remaining <= 0;
+            // still show the timer for a small negative remaining window to avoid flicker
+            this.hasTimer = remaining > -this.GRACE_MS;
           } else {
             this.sessionExpired = false;
             this.hasTimer = false;
@@ -322,10 +322,10 @@ export class TakeQuizComponent implements OnInit, OnDestroy {
     const mins = Math.floor(diff / 60000);
     const secs = Math.floor((diff % 60000) / 1000);
     this.timeLeftDisplay = `${mins.toString().padStart(2,'0')}:${secs.toString().padStart(2,'0')}`;
-    // Update sessionExpired in case it falls past the grace window while viewing
-    this.sessionExpired = diffRaw <= -this.GRACE_MS;
-    // Only auto-submit when we've passed the grace window (so tiny skews don't auto-submit immediately)
-    if (diffRaw <= -this.GRACE_MS) {
+    // Mark the session expired once expiry is reached, and auto-submit immediately to avoid the
+    // client waiting longer than the server (which would cause a 403 "Session expired").
+    this.sessionExpired = diffRaw <= 0;
+    if (diffRaw <= 0) {
       this.clearTimer();
       this.autoSubmit();
     }
@@ -352,9 +352,6 @@ export class TakeQuizComponent implements OnInit, OnDestroy {
     this.wheelPage = Math.floor(i / this.WHEEL_VISIBLE);
     this.saveSession();
   }
-
-  prevQuestion(): void { if (this.session.currentIndex > 0) { this.session.currentIndex--; this.saveSession(); } }
-  nextQuestion(): void { if (this.session.currentIndex < this.quiz.questions.length - 1) { this.gotoQuestion(this.session.currentIndex + 1); } }
 
   saveAndClose(): void { this.saveSession(); this.closeModal(); }
 

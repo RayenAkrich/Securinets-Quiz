@@ -44,6 +44,9 @@ JWT_EXP_SECONDS = int(os.environ.get('JWT_EXP_SECONDS', '14000'))
 if JWT_SECRET == 'please-change-this-secret':
     app.logger.warning('Using default JWT_SECRET; set JWT_SECRET in environment for production')
 
+# Session grace window (seconds) to tolerate small client/server clock skew or network latency
+SESSION_GRACE_SECONDS = int(os.environ.get('SESSION_GRACE_SECONDS', '5'))
+
 # In-memory store for pending signups:
 # { email: { full_name, password_hash, code_hash, expires_at, attempts, blocked_until } }
 pending_signups = {}
@@ -503,8 +506,8 @@ def api_submit_quiz(quiz_id):
     if not session_id:
         return jsonify({'ok': False, 'message': 'session_id is required'}), 400
 
-    if not isinstance(answers, list) or len(answers) == 0:
-        return jsonify({'ok': False, 'message': 'Answers required'}), 400
+    # answers may be empty if the client relied on per-question saves (SessionAnswers).
+    # We'll merge provided answers with any saved SessionAnswers for the session.
 
     if not ORACLE_AVAILABLE:
         return jsonify({'ok': False, 'message': 'Database not available'}), 503
@@ -531,7 +534,9 @@ def api_submit_quiz(quiz_id):
             cur.close()
             conn.close()
             return jsonify({'ok': False, 'message': 'Session is not active'}), 403
-        if s_expires is not None and datetime.utcnow() > s_expires:
+        # Allow a small grace window to tolerate clock skew and network latency. If now is beyond
+        # expires_at + grace, treat as expired. If within the grace window, allow the action.
+        if s_expires is not None and datetime.utcnow() > (s_expires + timedelta(seconds=SESSION_GRACE_SECONDS)):
             # expire the session
             try:
                 ucur = conn.cursor()
@@ -566,11 +571,50 @@ def api_submit_quiz(quiz_id):
             correct_map.setdefault(qid, set()).add(aid)
         acur.close()
 
+        # Load any per-question saved answers for this session and merge with provided answers
+        saved_map = {}
+        try:
+            sacur = conn.cursor()
+            sacur.execute("SELECT questionID, answerID FROM SessionAnswers WHERE session_id = :1", [session_id])
+            for r in sacur.fetchall():
+                try:
+                    saved_qid = int(r[0])
+                except Exception:
+                    continue
+                saved_aid = r[1]
+                # keep as-is (could be None)
+                saved_map[saved_qid] = saved_aid
+            sacur.close()
+        except Exception:
+            app.logger.exception('Failed to load SessionAnswers; continuing with provided answers')
+
+        # Merge provided answers into saved_map (provided answers take precedence)
+        try:
+            if isinstance(answers, list):
+                for ans in answers:
+                    try:
+                        qid = int(ans.get('questionID'))
+                    except Exception:
+                        continue
+                    aid = ans.get('answerID') if ('answerID' in ans) else None
+                    saved_map[qid] = aid
+        except Exception:
+            app.logger.exception('Error merging provided answers')
+
+        # Build final_answers by iterating known questions (ensures we grade only quiz questions)
+        final_answers = []
+        for qid in question_map.keys():
+            final_answers.append({'questionID': qid, 'answerID': saved_map.get(qid)})
+
+        # If no answers available at all, return error
+        if len(final_answers) == 0:
+            return jsonify({'ok': False, 'message': 'No answers available to grade'}), 400
+
         # Grade
         total_possible = sum(question_map.values())
         earned = 0.0
         per_question_results = []
-        for ans in answers:
+        for ans in final_answers:
             qid = int(ans.get('questionID'))
             aid = int(ans.get('answerID')) if ans.get('answerID') is not None else None
             correct_set = correct_map.get(qid, set())
@@ -677,7 +721,9 @@ def api_save_answer(quiz_id):
             cur.close()
             conn.close()
             return jsonify({'ok': False, 'message': 'Session is not active'}), 403
-        if s_expires is not None and datetime.utcnow() > s_expires:
+        # Allow a small grace window to tolerate clock skew and network latency. If now is beyond
+        # expires_at + grace, treat as expired. If within the grace window, allow the action.
+        if s_expires is not None and datetime.utcnow() > (s_expires + timedelta(seconds=SESSION_GRACE_SECONDS)):
             try:
                 ucur = conn.cursor()
                 ucur.execute("UPDATE Sessions SET status = 'expired', updated_at = :1 WHERE session_id = :2", [datetime.utcnow(), session_id])

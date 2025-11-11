@@ -70,4 +70,22 @@ export class App {
     this.userRole = null;
     this.router.navigate(['/']);
   }
+
+  onContact(event: MouseEvent): void {
+    // Prevent normal navigation when we may want to scroll to the footer
+    event.preventDefault();
+    try {
+      const current = this.router.url || '/';
+      if (current === '/' || current === '') {
+        const el = document.getElementById('site-footer');
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          return;
+        }
+      }
+    } catch (e) {
+      // ignore and fallback to navigation
+    }
+    this.router.navigate(['/contact']);
+  }
 }

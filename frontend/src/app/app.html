@@ -8,8 +8,9 @@
 		<nav class="main-nav">
 			<a routerLink="/">Home</a>
 			<a routerLink="/quizzes">Explore</a>
-			<a routerLink="/contact">Contact</a>
-      		<a *ngIf="userRole === 'admin'" routerLink="/admin">Admin Panel</a>
+			<!-- When on the welcome page, Contact will scroll to the footer. Otherwise it navigates to /contact -->
+			<a href="/contact" (click)="onContact($event)">Contact</a>
+	      	<a *ngIf="userRole === 'admin'" routerLink="/admin">Admin Panel</a>
 		</nav>
 
 		<div class="header-actions">
